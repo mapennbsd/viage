@@ -58,7 +58,11 @@ be a different user or a sandbox:
 - Run agents under another user, in a container, or in their own sandbox,
   so they cannot read your runtime directory or write your startup files.
 - Install viage root-owned (`/usr/local/bin`, mode 755) so it cannot be
-  modified without root.
+  modified without root. Before asking for the passphrase, viage warns if
+  it, age, age-keygen or the editor is writable by you, or sits in a
+  directory you can write to. A replaced viage would simply drop the
+  warning, so treat it as a check on how things are installed, not as
+  tamper detection.
 - Type the passphrase rather than pasting it. On most desktops any process
   running as you can read the clipboard. The same goes for secrets you
   copy out of the vault.

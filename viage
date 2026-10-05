@@ -8,12 +8,13 @@
 
 set -eu
 
-VERSION=0.1.0
+VERSION=0.2.0
 prog=viage
 
 VIAGE_DIR=${VIAGE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/viage}
 VIAGE_IDENTITY=${VIAGE_IDENTITY:-$VIAGE_DIR/identity.age}
 VIAGE_FILE=${VIAGE_FILE:-$VIAGE_DIR/secrets.age}
+editor=${VIAGE_EDITOR:-${VISUAL:-${EDITOR:-vi}}}
 
 usage() {
 	cat <<EOF
@@ -88,7 +89,6 @@ mktmp() {
 # off. Known editors are started without user config or plugins, so
 # nothing (an LSP, an AI completion plugin) gets to read the buffer.
 edit() {
-	editor=${VIAGE_EDITOR:-${VISUAL:-${EDITOR:-vi}}}
 	off='set noundofile nobackup nowritebackup'
 	# Word splitting is wanted: EDITOR may carry arguments.
 	# shellcheck disable=SC2086
@@ -112,8 +112,34 @@ edit() {
 	esac
 }
 
+# Warn about each program viage is about to trust with the passphrase or
+# the plaintext that a process running as you could replace: the script
+# itself, age, and the editor. Being writable by you is how an agent or
+# other same-user process would swap in a version that keeps a copy. This
+# cannot stop a replaced viage (it would drop the check), but it does flag
+# a writable install and a substituted age or editor.
+check_writable() {
+	[ "$(id -u)" -eq 0 ] && return 0
+	# $0 is the script as run, even "sh viage"; do not look it up in PATH.
+	[ -f "$0" ] && writable "$0"
+	for c in age age-keygen "${editor%% *}"; do
+		p=$(command -v "$c" 2>/dev/null) || continue
+		case $p in */*) writable "$p" ;; esac
+	done
+	return 0
+}
+
+writable() {
+	if [ -w "$1" ]; then
+		warn "warning: $1 is writable by you; anything running as you could replace it"
+	elif [ -w "$(dirname "$1")" ]; then
+		warn "warning: $(dirname "$1") is writable by you; anything running as you could replace $1"
+	fi
+}
+
 cmd_init() {
 	need age age-keygen
+	check_writable
 	[ -e "$VIAGE_IDENTITY" ] && die "$VIAGE_IDENTITY exists"
 	[ -e "$VIAGE_FILE" ] && die "$VIAGE_FILE exists"
 	mktmp
@@ -137,6 +163,7 @@ cmd_init() {
 
 cmd_edit() {
 	need age age-keygen cmp
+	check_writable
 	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
 	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found"
 	mktmp

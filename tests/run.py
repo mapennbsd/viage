@@ -167,6 +167,22 @@ def test_explicit_file(env):
     assert plaintext(dict(env, VIAGE_FILE=other)).endswith("other\n")
 
 
+def test_warns_writable(env):
+    editor(env, ":")
+    status, out = run([VIAGE], env)
+    assert status == 0, out
+    assert f"warning: {VIAGE} is writable" in out, out
+    assert f"warning: {env['VIAGE_EDITOR']} is writable" in out, out
+
+
+def test_no_warning_for_system_editor(env):
+    env["VIAGE_EDITOR"] = "/usr/bin/true"
+    status, out = run([VIAGE], env)
+    assert status == 0, out
+    assert "/usr/bin/true is writable" not in out, out
+    assert "/usr/bin is writable" not in out, out
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
