@@ -1,0 +1,197 @@
+#!/bin/sh
+# viage - edit an age-encrypted file, vipw style.
+#
+# The vault is encrypted to an age identity, and the identity is itself
+# encrypted with a passphrase. Each edit asks for the passphrase once,
+# decrypts into a RAM-backed directory, runs the editor and re-encrypts.
+# Plaintext never touches persistent storage.
+
+set -eu
+
+VERSION=0.1.0
+prog=viage
+
+VIAGE_DIR=${VIAGE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/viage}
+VIAGE_IDENTITY=${VIAGE_IDENTITY:-$VIAGE_DIR/identity.age}
+VIAGE_FILE=${VIAGE_FILE:-$VIAGE_DIR/secrets.age}
+
+usage() {
+	cat <<EOF
+usage: $prog [file]      edit the vault (default: \$VIAGE_FILE)
+       $prog init        create the identity and an empty vault
+       $prog -h | -V
+
+  VIAGE_DIR       $VIAGE_DIR
+  VIAGE_IDENTITY  $VIAGE_IDENTITY
+  VIAGE_FILE      $VIAGE_FILE
+  VIAGE_TMPDIR    RAM-backed directory for plaintext (required off Linux)
+  VIAGE_EDITOR    editor command (default: \$VISUAL, \$EDITOR, vi)
+
+Exit the editor with an error (:cq in vi) to discard changes.
+EOF
+}
+
+die() {
+	printf '%s: %s\n' "$prog" "$*" >&2
+	exit 1
+}
+
+warn() {
+	printf '%s: %s\n' "$prog" "$*" >&2
+}
+
+need() {
+	for c; do
+		command -v "$c" >/dev/null 2>&1 || die "$c not found (install age)"
+	done
+}
+
+# Print a RAM-backed directory to hold plaintext, or fail. On Linux the
+# filesystem type is checked; elsewhere VIAGE_TMPDIR must be set and the
+# user vouches for it.
+ramdir() {
+	if [ "$(uname -s)" != Linux ]; then
+		[ -n "${VIAGE_TMPDIR:-}" ] ||
+			die "set VIAGE_TMPDIR to a RAM-backed directory on $(uname -s)"
+		printf '%s\n' "$VIAGE_TMPDIR"
+		return
+	fi
+	for d in ${VIAGE_TMPDIR:-} ${XDG_RUNTIME_DIR:-} /dev/shm; do
+		[ -d "$d" ] && [ -w "$d" ] || continue
+		case $(stat -f -c %T "$d" 2>/dev/null) in
+		tmpfs | ramfs)
+			printf '%s\n' "$d"
+			return
+			;;
+		esac
+		[ "$d" = "${VIAGE_TMPDIR:-}" ] && die "$d is not tmpfs or ramfs"
+	done
+	die "no RAM-backed directory found; set VIAGE_TMPDIR"
+}
+
+tmp=
+cleanup() {
+	[ -n "$tmp" ] && rm -rf "$tmp"
+	tmp=
+}
+
+mktmp() {
+	umask 077
+	tmp=$(mktemp -d "$(ramdir)/$prog.XXXXXX") || die "mktemp failed"
+	trap cleanup EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+}
+
+# Run the editor on $1 with swap, undo, backup and history files turned
+# off. Known editors are started without user config or plugins, so
+# nothing (an LSP, an AI completion plugin) gets to read the buffer.
+edit() {
+	editor=${VIAGE_EDITOR:-${VISUAL:-${EDITOR:-vi}}}
+	off='set noundofile nobackup nowritebackup'
+	# Word splitting is wanted: EDITOR may carry arguments.
+	# shellcheck disable=SC2086
+	set -- "$1" $editor
+	file=$1
+	shift
+	case ${1##*/} in
+	nvim | vim | vi)
+		# vi may be nvi or busybox, which do not know these flags.
+		if [ "${1##*/}" = vi ] && ! "$1" --version 2>/dev/null | grep -Eq '^N?VIM'; then
+			warn "unknown vi; check it writes no swap or backup files"
+			TMPDIR=$tmp "$@" "$file"
+		else
+			TMPDIR=$tmp "$@" --clean -n -i NONE -c "$off" "$file"
+		fi
+		;;
+	*)
+		warn "unknown editor $1; check it writes no swap or backup files"
+		TMPDIR=$tmp "$@" "$file"
+		;;
+	esac
+}
+
+cmd_init() {
+	need age age-keygen
+	[ -e "$VIAGE_IDENTITY" ] && die "$VIAGE_IDENTITY exists"
+	[ -e "$VIAGE_FILE" ] && die "$VIAGE_FILE exists"
+	mktmp
+	mkdir -p "$VIAGE_DIR" "$(dirname "$VIAGE_IDENTITY")" "$(dirname "$VIAGE_FILE")"
+
+	age-keygen -o "$tmp/identity" 2>/dev/null
+	recipient=$(age-keygen -y "$tmp/identity")
+
+	printf 'Choose the vault passphrase.\n' >&2
+	age -p -o "$VIAGE_IDENTITY.new" "$tmp/identity" ||
+		{ rm -f "$VIAGE_IDENTITY.new"; die "identity not created"; }
+	: | age -r "$recipient" -o "$VIAGE_FILE.new"
+	mv -f "$VIAGE_IDENTITY.new" "$VIAGE_IDENTITY"
+	mv -f "$VIAGE_FILE.new" "$VIAGE_FILE"
+
+	printf 'created %s\ncreated %s\n' "$VIAGE_IDENTITY" "$VIAGE_FILE" >&2
+	printf 'Back up the passphrase. Without it and %s the vault is lost.\n' \
+		"${VIAGE_IDENTITY##*/}" >&2
+}
+
+cmd_edit() {
+	need age age-keygen cmp
+	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
+	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found"
+	mktmp
+
+	# Snapshot the ciphertext first, so a concurrent save is detected.
+	cp "$VIAGE_FILE" "$tmp/orig.age"
+
+	age -d -o "$tmp/identity" "$VIAGE_IDENTITY" || die "cannot unlock identity"
+	# Derive the recipient from the identity every time. A recipient file
+	# on shared storage could be swapped for someone else's key.
+	recipient=$(age-keygen -y "$tmp/identity")
+	age -d -i "$tmp/identity" -o "$tmp/orig" "$tmp/orig.age" ||
+		die "cannot decrypt $VIAGE_FILE"
+	cp "$tmp/orig" "$tmp/${VIAGE_FILE##*/}.txt"
+	plain=$tmp/${VIAGE_FILE##*/}.txt
+
+	# A ^C meant for the editor must not abort the save afterwards.
+	trap : INT QUIT
+	if ! edit "$plain"; then
+		warn "editor exited with an error; changes discarded"
+		exit 1
+	fi
+	trap 'exit 130' INT
+	trap - QUIT
+	if cmp -s "$tmp/orig" "$plain"; then
+		warn "no changes"
+		exit 0
+	fi
+
+	new=$VIAGE_FILE.new.$$
+	age -r "$recipient" -o "$new" "$plain" ||
+		{ rm -f "$new"; die "encryption failed; vault unchanged"; }
+	# Read it back before trusting it, in case of a short write (NFS).
+	if ! age -d -i "$tmp/identity" "$new" | cmp -s - "$plain"; then
+		rm -f "$new"
+		die "verification failed; vault unchanged"
+	fi
+	if ! cmp -s "$tmp/orig.age" "$VIAGE_FILE"; then
+		die "$VIAGE_FILE changed during the edit; your version is in $new"
+	fi
+	cp -p "$VIAGE_FILE" "$VIAGE_FILE.bak"
+	mv -f "$new" "$VIAGE_FILE"
+	warn "saved $VIAGE_FILE"
+}
+
+case ${1:-} in
+-h | --help) usage ;;
+-V | --version) printf '%s %s\n' "$prog" "$VERSION" ;;
+init)
+	[ $# -eq 1 ] || die "init takes no arguments"
+	cmd_init
+	;;
+-*) usage >&2; exit 2 ;;
+*)
+	[ $# -le 1 ] || { usage >&2; exit 2; }
+	[ $# -eq 1 ] && VIAGE_FILE=$1
+	cmd_edit
+	;;
+esac
