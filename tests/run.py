@@ -84,6 +84,7 @@ def read(path):
 
 
 def test_init_and_edit(env):
+    assert read(env["VIAGE_IDENTITY"]).startswith(b"-----BEGIN AGE ENCRYPTED FILE-----\n")
     assert plaintext(env) == ""
     editor(env, 'echo "token=abc123" >> "$1"')
     status, out = run([VIAGE], env)

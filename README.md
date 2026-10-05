@@ -30,11 +30,22 @@ viage init
 `viage init` creates two files:
 
 - `identity.age`: a fresh age identity, encrypted with your passphrase.
+  It is ASCII-armored text, so it can be pasted into a password manager
+  note as a backup.
 - `secrets.age`: an empty vault, encrypted to that identity.
 
 Both are safe to keep on shared or backed-up storage. To recover the vault
 you need the passphrase and a copy of `identity.age`; keep both somewhere
 other than where the vault lives.
+
+An identity created by an earlier viage is binary. age reads either form;
+to convert one to text without re-encrypting it:
+
+```
+{ echo '-----BEGIN AGE ENCRYPTED FILE-----'
+  base64 -w64 identity.age
+  echo '-----END AGE ENCRYPTED FILE-----'; } > identity.age.txt
+```
 
 ## Use
 

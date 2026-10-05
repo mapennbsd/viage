@@ -123,7 +123,8 @@ cmd_init() {
 	recipient=$(age-keygen -y "$tmp/identity")
 
 	printf 'Choose the vault passphrase.\n' >&2
-	age -p -o "$VIAGE_IDENTITY.new" "$tmp/identity" ||
+	# Armored, so the identity can be pasted into a password manager note.
+	age -p -a -o "$VIAGE_IDENTITY.new" "$tmp/identity" ||
 		{ rm -f "$VIAGE_IDENTITY.new"; die "identity not created"; }
 	: | age -r "$recipient" -o "$VIAGE_FILE.new"
 	mv -f "$VIAGE_IDENTITY.new" "$VIAGE_IDENTITY"
