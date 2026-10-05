@@ -94,9 +94,16 @@ your sops files use can itself live in the viage vault.
 Requires `age` and `age-keygen` (v1.1 or later) and a POSIX shell.
 
 ```
-install -m 755 viage ~/.local/bin/
+sudo install -o root -g root -m 755 viage /usr/local/bin/
 viage init
 ```
+
+Install it owned by root, as above, not in a directory you own such as
+`~/.local/bin` or `~/bin`. A copy you can write to can be replaced by
+anything running as you, including an AI agent, with a version that keeps
+the passphrase. viage warns before the passphrase prompt if it, age or the
+editor is writable by you (see [Why](#why-secrets-and-ai-agents)). On BSD
+and macOS, use `-g wheel`.
 
 `viage init` creates two files:
 
