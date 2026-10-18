@@ -15,7 +15,7 @@ import (
 )
 
 func cmdInit() {
-	for _, f := range []string{identityPath, vaultFile} {
+	for _, f := range []string{identityPath, vaultFile, indexPath()} {
 		if exists(f) {
 			die("%s exists", f)
 		}
@@ -32,7 +32,14 @@ func cmdInit() {
 	// Armored, so the identity can be pasted into a password manager note.
 	id, idFile := newIdentity("identity not created")
 	publishNew(stage(idFile, identityPath), identityPath)
-	publishNew(stage(sealTo(nil, id), vaultFile), vaultFile)
+	vault := sealTo(nil, id)
+	publishNew(stage(vault, vaultFile), vaultFile)
+	ix := &vaultIndex{Files: map[string]*fileMeta{}}
+	if name := inVault(vaultFile); name != "" {
+		ix.record(name, vault)
+		ix.Files[name].Description = "default vault"
+	}
+	publishNew(stage(ix.seal(id), indexPath()), indexPath())
 
 	fmt.Fprintf(os.Stderr, "created %s\ncreated %s\n", identityPath, vaultFile)
 	fmt.Fprintf(os.Stderr, "Back up the passphrase. Without it and %s the vault is lost.\n",
@@ -115,6 +122,10 @@ func cmdEdit() {
 	if fi, err := os.Stat(vaultFile); err != nil || !fi.Mode().IsRegular() {
 		die("%s not found (see %s list)", vaultFile, prog)
 	}
+	name := inVault(vaultFile)
+	if name == indexName {
+		die("%s is kept by %s; change descriptions with %s describe", vaultFile, prog, prog)
+	}
 	mktmp()
 	// For the whole session, editor included, as vipw does.
 	lockVault()
@@ -129,6 +140,10 @@ func cmdEdit() {
 	before, err := decrypt(orig, id)
 	if err != nil {
 		die("cannot decrypt %s", vaultFile)
+	}
+	var ix *vaultIndex
+	if name != "" {
+		ix = mustLoadIndex(id, "nothing was opened")
 	}
 	if bytes.IndexByte(before, 0) >= 0 {
 		die("%s holds binary data; use %s cat to get it out", vaultFile, prog)
@@ -161,6 +176,12 @@ func cmdEdit() {
 	}
 	publishOver(stage(orig, vaultFile+".bak"), vaultFile+".bak")
 	publishOver(stage(ct, vaultFile), vaultFile)
+	if ix != nil {
+		ix.adopt(id)
+		ix.record(name+".bak", orig)
+		ix.record(name, ct)
+		ix.save(id)
+	}
 	warn("saved %s", vaultFile)
 }
 

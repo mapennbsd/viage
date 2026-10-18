@@ -45,10 +45,22 @@ type addItem struct {
 // if it is in the vault directory. Every file is read and decrypted, in
 // memory, before anything is written.
 func cmdAdd(args []string) {
-	keep := false
-	if len(args) > 0 && args[0] == "-k" {
-		keep = true
-		args = args[1:]
+	keep, describe := false, ""
+flags:
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		switch {
+		case args[0] == "-k":
+			keep = true
+			args = args[1:]
+		case args[0] == "-m" && len(args) > 1:
+			describe = strings.TrimSpace(args[1])
+			args = args[2:]
+		case args[0] == "--":
+			args = args[1:]
+			break flags
+		default:
+			usageError()
+		}
 	}
 	if len(args) == 0 {
 		usageError()
@@ -70,6 +82,9 @@ func cmdAdd(args []string) {
 			die("%s is the identity", f)
 		}
 		dest := addDest(f)
+		if filepath.Base(dest) == indexName {
+			die("%s is the name of the index; rename the file first", indexName)
+		}
 		if exists(dest) && !sameFile(f, dest) {
 			die("%s exists", dest)
 		}
@@ -80,6 +95,8 @@ func cmdAdd(args []string) {
 	}
 
 	id := unlock()
+	ix := mustLoadIndex(id, "nothing added")
+	ix.adopt(id)
 	var items []addItem
 	for _, f := range args {
 		orig, err := os.ReadFile(f)
@@ -115,18 +132,37 @@ func cmdAdd(args []string) {
 	}
 
 	for _, it := range items {
+		name := filepath.Base(it.dest)
 		if it.skip {
-			warn("%s is already in the vault", it.dest)
+			if m := ix.Files[name]; m != nil && m.SHA256 == checksum(it.orig) && (describe == "" || m.Description == describe) {
+				warn("%s is already in the vault", it.dest)
+				continue
+			}
+			ix.record(name, it.orig)
+			if describe != "" {
+				ix.Files[name].Description = describe
+			}
+			ix.save(id)
+			warn("%s is already in the vault; recorded it in the index", it.dest)
 			continue
 		}
 		exposed := !it.imported && !isRAM(it.src)
-		staged := stage(sealTo(it.plain, id), it.dest)
+		ct := sealTo(it.plain, id)
+		staged := stage(ct, it.dest)
 		if it.inPlace {
 			publishOver(staged, it.dest)
+		} else {
+			publishNew(staged, it.dest)
+		}
+		ix.record(name, ct)
+		if describe != "" {
+			ix.Files[name].Description = describe
+		}
+		ix.save(id)
+		if it.inPlace {
 			warn("re-encrypted %s to the vault identity", it.dest)
 			continue
 		}
-		publishNew(staged, it.dest)
 		switch now, err := os.ReadFile(it.src); {
 		case keep:
 			warn("added %s; kept %s", it.dest, it.src)

@@ -66,7 +66,7 @@ func cmdRekey() {
 			}
 			continue
 		}
-		if !strings.HasSuffix(name, ".age") && !strings.HasSuffix(name, ".age.bak") {
+		if !isVaultName(name) || name == indexName {
 			continue
 		}
 		if fi.Mode()&fs.ModeSymlink != 0 {
@@ -93,6 +93,8 @@ func cmdRekey() {
 	}
 
 	id := unlock()
+	ix := mustLoadIndex(id, "nothing changed")
+	ix.adopt(id)
 	var items []rekeyItem
 	for _, p := range paths {
 		orig, err := os.ReadFile(p)
@@ -117,11 +119,19 @@ func cmdRekey() {
 	setRekeying("writing")
 	publishOver(stage(idFile, identityPath), identityPath+".rekey")
 	for _, it := range items {
-		publishOver(stage(sealTo(it.plain, newID), it.path), it.path+".rekey")
+		ct := sealTo(it.plain, newID)
+		publishOver(stage(ct, it.path), it.path+".rekey")
 		if now, err := os.ReadFile(it.path); err != nil || !bytes.Equal(now, it.orig) {
 			die("%s changed during the rekey; nothing changed", it.path)
 		}
+		if m := ix.Files[filepath.Base(it.path)]; m != nil {
+			m.SHA256 = checksum(ct)
+		} else {
+			ix.record(filepath.Base(it.path), ct)
+		}
 	}
+	// The index goes with the files, authenticated by the new identity.
+	publishOver(stage(ix.seal(newID), indexPath()), indexPath()+".rekey")
 
 	// The identity goes first and the old one is kept until every file
 	// is in place, so an interruption leaves something recoverable.
@@ -132,6 +142,7 @@ func cmdRekey() {
 	for _, it := range items {
 		mustRename(it.path+".rekey", it.path)
 	}
+	mustRename(indexPath()+".rekey", indexPath())
 	syncDir(filepath.Dir(identityPath))
 	syncDir(vaultDir)
 	os.Remove(identityPath + ".old")

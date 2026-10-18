@@ -44,8 +44,12 @@ var (
 func usage() string {
 	return fmt.Sprintf(`usage: %[1]s [name]            edit a vault file (default: $VIAGE_FILE)
        %[1]s cat [name]        print a vault file to stdout
-       %[1]s add [-k] file...  encrypt files into the vault, then remove them
-       %[1]s list              show what is in the vault
+       %[1]s add [-k] [-m text] file...
+                               encrypt files into the vault, then remove them
+       %[1]s describe name [text]
+                               set or clear the description of a vault file
+       %[1]s list [-v]         show what is in the vault; -v unlocks it to
+                               show descriptions and check every file
        %[1]s init              create the identity and an empty vault
        %[1]s rekey             new identity and passphrase; re-encrypt the vault
        %[1]s -h | -V
@@ -148,11 +152,17 @@ func main() {
 		cmdCat()
 	case "add":
 		cmdAdd(args[1:])
+	case "describe":
+		cmdDescribe(args[1:])
 	case "list", "ls":
-		if len(args) != 1 {
-			die("list takes no arguments")
+		switch {
+		case len(args) == 1:
+			cmdList(false)
+		case len(args) == 2 && args[1] == "-v":
+			cmdList(true)
+		default:
+			die("list takes only -v")
 		}
-		cmdList()
 	case "rekey":
 		if len(args) != 1 {
 			die("rekey takes no arguments")

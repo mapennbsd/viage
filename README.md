@@ -16,9 +16,12 @@ file server, in snapshots and in cloud backups are always ciphertext.
 The exceptions are the ones you choose: `viage cat` prints the plaintext
 wherever you send it, and anything you copy goes to the clipboard.
 
-viage is a single POSIX shell script with age doing all the cryptography.
-It is short enough to read in one sitting, which you should do before
-trusting it with secrets.
+viage is a small Go program built on [age's own
+library](https://pkg.go.dev/filippo.io/age), which does all the
+cryptography. It is about 1,800 lines with no other dependencies beyond
+the Go project's `x/term` and `x/sys`; read it before trusting it with
+secrets. Version 0.5 and earlier were a POSIX shell script; the Go
+version reads the same vault.
 
 ## Why: secrets and AI agents
 
@@ -41,27 +44,32 @@ viage keeps secrets out of that path:
 
 - **At rest, the vault is ciphertext.** An agent that greps your files sees
   nothing useful, and there is no unlocked session for it to borrow.
-- **Unlocking takes a human.** age reads the passphrase from the terminal
-  only, never from an environment variable, file or pipe. Do not store the
-  passphrase anywhere an agent can read it.
-- **The plaintext window is short.** It exists only while you edit, in a
-  private directory in RAM that is removed when the editor exits.
+- **Unlocking takes a human.** viage reads the passphrase from the
+  terminal only, never from an environment variable, file or pipe. Do not
+  store the passphrase anywhere an agent can read it.
+- **The key never touches a disk.** The decrypted identity, which opens
+  every file in the vault and every old copy of it, stays in viage's
+  memory. On Linux that memory cannot be read by other processes running
+  as you.
+- **The plaintext window is short.** Only the file you edit is written
+  out, to a private directory in RAM that is removed when the editor
+  exits. `cat`, `add` and `rekey` write no plaintext at all.
 - **The editor runs without plugins.** vim and neovim start with no user
   config, so an AI completion plugin or language server never sees the
   buffer.
 
 What viage cannot do is defend against a hostile process running as you.
-While the editor is open, the plaintext is readable by your user. And an
-agent that can write to your home directory could replace the `viage`
-script, or change your shell startup files or `$EDITOR`, to capture the
-passphrase or the plaintext next time. For that threat the boundary has to
+While the editor is open, the file being edited is readable by your user.
+And an agent that can write to your home directory could replace the
+`viage` binary, or change your shell startup files or `$EDITOR`, to
+capture the passphrase or the plaintext next time. For that threat the boundary has to
 be a different user or a sandbox:
 
 - Run agents under another user, in a container, or in their own sandbox,
   so they cannot read your runtime directory or write your startup files.
 - Install viage root-owned (`/usr/local/bin`, mode 755) so it cannot be
   modified without root. Before asking for the passphrase, viage warns if
-  it, age, age-keygen or the editor is writable by you, or sits in a
+  it or the editor is writable by you, or sits in a
   directory you can write to. A replaced viage would simply drop the
   warning, so treat it as a check on how things are installed, not as
   tamper detection.
@@ -80,12 +88,12 @@ your editor and supports age. They are built for different jobs.
 |---|---|---|
 | For | secrets a person reads | secrets a program reads |
 | Content | any text, encrypted whole | YAML, JSON, ENV or INI values; keys stay readable |
-| What an onlooker sees | nothing, not even what kind of secrets exist | the names of every secret |
+| What an onlooker sees | file names only; descriptions are encrypted | the names of every secret |
 | Unattended decryption | no, by design | yes: `sops -d`, `sops exec-env`, cloud KMS |
 | Plaintext during an edit | refused unless on tmpfs or ramfs | the system temp directory, which may be on disk |
 | Editor | vim and neovim without config or plugins | `$EDITOR` with your full config |
 | Keys | one age identity behind a passphrase | age, PGP, cloud KMS, HashiCorp Vault |
-| Size | one shell script | a large Go program |
+| Size | a small Go program on age's library | a large Go program |
 
 Use sops for configuration that deployments and CI need to decrypt, where
 diffable files in git matter. Use viage for the master copy of secrets
@@ -94,31 +102,36 @@ your sops files use can itself live in the viage vault.
 
 ## Install
 
-Requires `age` and `age-keygen` (v1.1 or later) and a POSIX shell. The
-rest is in any Linux or BSD base system: `cmp`, `mktemp`, `dd`, `tr`,
-`sed`, `awk`, `df`. `base64` is optional (`list` uses it to read armored
-files), and so is `wl-copy` (see [Copying a secret](#copying-a-secret)).
+Build it with Go 1.27 or later; viage does not need the age command
+itself. `wl-copy` is optional (see [Copying a secret](#copying-a-secret)).
 
 ```
+CGO_ENABLED=0 go build -trimpath -o viage .
 sudo install -o root -g root -m 755 viage /usr/local/bin/
 viage init
 ```
 
+The build is reproducible: the same source and Go version give the same
+binary, byte for byte, so a build on one machine can be checked against
+another. `go mod verify` checks the dependencies against `go.sum`.
+
 Install it owned by root, as above, not in a directory you own such as
 `~/.local/bin` or `~/bin`. A copy you can write to can be replaced by
 anything running as you, including an AI agent, with a version that keeps
-the passphrase. viage warns before the passphrase prompt if it, age or the
+the passphrase. viage warns before the passphrase prompt if it or the
 editor is writable by you (see [Why](#why-secrets-and-ai-agents)). On BSD
 and macOS, use `-g wheel`.
 
-`viage init` creates two files:
+`viage init` creates three files:
 
 - `identity.age`: a fresh age identity, encrypted with your passphrase.
   It is ASCII-armored text, so it can be pasted into a password manager
   note as a backup.
 - `secrets.age`: an empty vault, encrypted to that identity.
+- `index.age`: descriptions and checksums of the vault files (see
+  [Descriptions and checksums](#descriptions-and-checksums)).
 
-Both are safe to keep on shared or backed-up storage. To recover the vault
+All are safe to keep on shared or backed-up storage. To recover the vault
 you need the passphrase and a copy of `identity.age`; keep both somewhere
 other than where the vault lives.
 
@@ -128,7 +141,7 @@ home is the better place for it: snapshots and backups of your home
 still get the ciphertext, and nothing else that shares a file server can
 see it.
 
-An identity created by an earlier viage is binary. age reads either form;
+An identity created by an early viage is binary. viage and age read either form;
 to convert one to text without re-encrypting it:
 
 ```
@@ -145,7 +158,10 @@ viage notes        # edit $VIAGE_DIR/notes.age
 viage cat          # print $VIAGE_FILE to stdout
 viage cat notes
 viage add file...  # encrypt files into the vault and remove the originals
+viage add -m "LUKS header backup, root" root.luks-header
+viage describe notes "meeting notes"
 viage list         # what is in the vault, without the passphrase
+viage list -v      # with descriptions, checking every file
 viage rekey        # new identity and passphrase for everything in $VIAGE_DIR
 ```
 
@@ -158,10 +174,11 @@ holds binary data, such as a LUKS header, is not opened in the editor;
 use `viage cat` to get it out.
 
 Like `vipw`, viage writes the vault one command at a time. `edit`, `add`,
-`rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
+`describe`, `rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
 finish; an edit holds it for as long as the editor is open. Another
 writer started meanwhile stops with "the vault is in use". Reading
-(`cat`, `list`) needs no lock. If viage was killed and left the lock
+(`cat`, `list`) needs no lock. The shell versions use the same lock, so
+the two can share a vault. If viage was killed and left the lock
 behind, it says which process held it; remove the directory once no
 viage is running.
 
@@ -185,10 +202,11 @@ refused, because deleting the link would leave the plaintext it points
 to; add the file itself.
 
 A file that is already age-encrypted is decrypted first and re-encrypted
-to the identity. If it has a passphrase of its own, age asks for it. That
+to the identity. If it has a passphrase of its own, viage asks for it. That
 is how a file made with `age -p` comes under the vault; if it is already
 in `$VIAGE_DIR`, it is re-encrypted in place. A file encrypted to another
-key is refused.
+key is refused. Each source is read once, into memory; if it changes
+before viage would remove it, it is kept.
 
 Removing the original is an ordinary delete. On a copy-on-write
 filesystem (btrfs, ZFS) nothing better is possible, and snapshots and
@@ -211,8 +229,38 @@ that is not encrypted at all, a file with a passphrase of its own, a
 file or directory open to other users, a held lock, and leftovers from
 an interrupted edit, add or rekey. It reads only the age headers and
 asks for no passphrase. A header shows whether a file has its
-own passphrase or is encrypted to a key, but not which key; only `cat` or
-`rekey` can confirm a file opens with the identity.
+own passphrase or is encrypted to a key, but not which key; only `cat`,
+`list -v` or `rekey` can confirm a file opens with the identity.
+
+### Descriptions and checksums
+
+`index.age` holds, for each vault file, a description, the dates it was
+added and last written, and the SHA-256 of its ciphertext. viage updates
+it whenever it writes a vault file. It is encrypted to the identity like
+the rest, so descriptions are as private as the secrets; `list` without
+`-v` shows only file names and the labels viage can tell for itself.
+
+`viage list -v` asks for the passphrase, shows each description, and
+checks every file against its checksum. It flags:
+
+- **CHANGED OUTSIDE VIAGE:** the file is not what viage last wrote. It
+  may be an older copy put back, a file swapped for another one from the
+  vault, or a viage interrupted between writing a file and the index.
+  Check it with `viage cat`. `viage add` on the file records it as it is.
+- **MISSING:** in the index, but not in the vault.
+- **not in the index:** a vault file viage has not written since the
+  index was made; `viage add` records it.
+
+age encryption does not prove who wrote a file: anyone who knows your
+public key can encrypt to it. So the index also carries an HMAC keyed
+from the identity, and viage refuses an index that does not verify. A
+command that writes the vault stops rather than go on with it; move
+`index.age` out of the vault to continue without one. The next command
+that writes the vault makes a new index and records every file that
+opens with the identity, as it is at that moment.
+
+The index cannot notice the whole vault, index included, being replaced
+by an older copy; only your own backups can tell you that.
 
 ### Copying a secret
 
@@ -253,14 +301,14 @@ time to press ^C:
 - **A pipe:** the reader decides where it ends up. To copy, use
   `wl-copy --sensitive`, not plain `wl-copy`.
 
-An agent cannot run `viage cat` by itself, because age reads the
+An agent cannot run `viage cat` by itself, because viage reads the
 passphrase from the terminal.
 
 ### Changing the passphrase
 
 `viage rekey` makes a new identity under a new passphrase and re-encrypts
 every `*.age` and `*.age.bak` file in `$VIAGE_DIR` to it, hidden files
-included. The old identity
+included, along with the index. The old identity
 is replaced, not re-wrapped, because changing only the passphrase would
 not revoke the old one. Every copy of the old `identity.age` (snapshots,
 backups, a file server) would still open with the old passphrase, and it
@@ -270,9 +318,9 @@ After a rekey, copies of the old identity open only copies of the vault
 made before the rekey. Those still hold your secrets as they were. If the
 old passphrase may be known, rotate the secrets themselves.
 
-Each file is decrypted, re-encrypted, verified in RAM, written beside the
-original as `*.rekey` and compared byte for byte before anything is
-renamed. A failure up to that point changes nothing: the `*.rekey` files
+Each file is decrypted, re-encrypted and verified in memory, written
+beside the original as `*.rekey`, flushed to disk and read back before
+anything is renamed. A failure up to that point changes nothing: the `*.rekey` files
 are removed and the vault is as it was.
 
 A file in `$VIAGE_DIR` that the identity does not open is skipped with a
@@ -318,21 +366,21 @@ you keep elsewhere.
 
 ## How it works
 
-1. Take the vault lock, and copy the ciphertext aside to detect a change
-   by anything else later.
-2. Decrypt `identity.age` (the only prompt) into a private directory on
-   tmpfs. The recipient is derived from it each time rather than read from
-   a file, so a writable vault directory cannot redirect encryption to
-   someone else's key.
-3. Decrypt the vault next to it and run the editor.
-4. If the content changed: encrypt it in the private directory, decrypt
-   it again and compare, and check the vault was not changed meanwhile.
-   Copy the previous ciphertext to a new file beside the vault and rename
-   it to `secrets.age.bak`, then do the same with the new ciphertext and
-   `secrets.age`. Each copy goes to a file made fresh by `mktemp`, mode
-   600, and renaming replaces the old name rather than writing through
-   it, so a symlink planted in the vault directory cannot redirect a
-   write.
+1. Take the vault lock, and keep the ciphertext in memory to detect a
+   change by anything else later.
+2. Decrypt `identity.age` (the only prompt) in memory. The recipient is
+   derived from it each time rather than read from a file, so a writable
+   vault directory cannot redirect encryption to someone else's key.
+3. Decrypt the vault into a file in a private directory on tmpfs and run
+   the editor on it.
+4. If the content changed: encrypt it, decrypt it again and compare, and
+   check the vault was not changed meanwhile. Write the previous
+   ciphertext to a new file beside the vault and rename it to
+   `secrets.age.bak`, then do the same with the new ciphertext and
+   `secrets.age`, and record both in the index. Each new file is created
+   only if its name is new, mode 600, flushed to disk and read back; the
+   rename replaces the old name rather than writing through it, so a
+   symlink planted in the vault directory cannot redirect a write.
 5. Remove the private directory and the lock, on any exit.
 
 ## What it protects against, and what it does not
@@ -342,17 +390,20 @@ your files, a stolen disk, a compromised file server or backup host, a
 cloud provider, an old snapshot. The passphrase is stretched with scrypt by
 age, so its strength is what matters.
 
-It does not protect against an attacker running as you or as root on the
-machine while you edit. The plaintext and the decrypted identity sit in
-tmpfs, readable by your user, for as long as the editor is open.
+It does not protect against an attacker running as root, or running as
+you while you edit: the file being edited sits in tmpfs, readable by your
+user, for as long as the editor is open, and the editor's memory is as
+readable as any of your processes. The decrypted identity is not in
+tmpfs, and on Linux viage marks itself non-dumpable, so other processes
+running as you cannot read its memory or its `/proc` files.
 
 Points to be aware of:
 
 - **Swap.** tmpfs pages can be swapped out. Use encrypted swap, or zram
   only. OpenBSD encrypts swap by default; on FreeBSD use an `.eli` swap
   device.
-- **Core dumps.** viage sets the core size limit to 0, and the editor and
-  age inherit it, so a crash does not write their memory, plaintext
+- **Core dumps.** viage sets the core size limit to 0, and the editor
+  inherits it, so a crash does not write their memory, plaintext
   included, to a core file. systemd-coredump honors the limit: it logs
   the crash and stores no core.
 - **The editor.** vim and neovim are started with `--clean -n -i NONE` and
@@ -366,34 +417,39 @@ Points to be aware of:
   and `viage cat` warns where its output is going. Terminal scrollback
   and clipboard managers that ignore the hint are up to you.
 - **Rollback.** Someone who can write to the vault directory can replace
-  `secrets.age` with an older copy. age authenticates the content, so they
-  cannot forge or alter it.
-- **Platforms.** viage checks that the plaintext directory is RAM-backed:
-  tmpfs or ramfs on Linux, tmpfs on FreeBSD, mfs on OpenBSD (a tmpfs or
-  mfs `/tmp` is found by itself). If the type cannot be read, it refuses.
-  On macOS a RAM disk looks like any other volume, so `VIAGE_TMPDIR` must
-  be set and you vouch for it. Tested on Linux; the BSD checks are tested
-  by simulation only so far.
-- **Changing a file while adding it.** The lock keeps viage commands
-  apart, not other programs. If a file is changed by something else while
-  `viage add` is working on it, the vault may get the earlier version and
-  the original is still removed. Do not add a file that is still being
-  written.
+  a file with an older copy. age authenticates the content, so they
+  cannot forge or alter it, and `list -v` flags a single file put back.
+  Replacing the whole vault with an older copy, index included, goes
+  unnoticed.
+- **Platforms.** viage asks the kernel whether the plaintext directory
+  is RAM-backed: tmpfs or ramfs on Linux, tmpfs on FreeBSD, mfs on
+  OpenBSD (a tmpfs or mfs `/tmp` is found by itself). If the type cannot
+  be read, it refuses. On macOS a RAM disk looks like any other volume,
+  so `VIAGE_TMPDIR` must be set and you vouch for it. Non-dumpable memory
+  is Linux only; elsewhere viage sets the core limit alone. Tested on
+  Linux; it builds for FreeBSD, OpenBSD and macOS but has not yet been
+  run there.
 - **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
   Its working file goes to the private directory, but if it is killed or
   the terminal hangs up, it saves a recovery copy, in plaintext, to
   `/var/tmp/vi.recover`. Use `VIAGE_EDITOR=vim` or `nvim` there.
-- **`viage cat` on BSD.** It cannot see where its
-  output goes (there is no `/proc`), so it gives the general warning.
+- **`viage cat` on BSD.** It can tell a file on disk from one in RAM,
+  but not its name (there is no `/proc`), so the warning says "a file".
 
 ## Tests
 
 ```
-python3 tests/run.py
+go test ./...
+CGO_ENABLED=0 go build -trimpath -o build/viage .
+VIAGE_BIN=build/viage python3 tests/run.py
 ```
 
-The tests drive age's passphrase prompts through a pseudo-terminal, so they
-need nothing beyond Python and age.
+The Go tests cover what the binary cannot be driven into from outside.
+`tests/run.py` is the test of record: it drives viage's passphrase
+prompts through a pseudo-terminal and needs Python and the age command,
+which it uses to make and check files independently of viage. Without
+`VIAGE_BIN` it tests the shell version, which must pass the same tests,
+less those for the index.
 
 ## License
 

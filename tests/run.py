@@ -743,6 +743,136 @@ def test_no_core_dumps(env):
     assert open(seen).read().strip() == "0"
 
 
+# --- the index (Go version only)
+
+
+def go_only(test):
+    def wrapper(env):
+        if not SHELL:
+            test(env)
+    wrapper.__name__ = test.__name__
+    return wrapper
+
+
+def listing(env, *args, passphrase=PASS):
+    status, out = run([VIAGE, "list", *args], env, passphrase)
+    assert status == 0, out
+    rows = {}
+    for line in out.splitlines():
+        if line.strip() and not line.startswith("viage:") and "passphrase" not in line.lower():
+            rows[line.split()[0]] = line
+    return out, rows
+
+
+@go_only
+def test_index_created_by_init(env):
+    assert os.path.exists(env["VIAGE_DIR"] + "/index.age")
+    out, rows = listing(env)
+    assert "passphrase" not in out.lower(), out
+    assert "index (descriptions" in rows["index.age"], out
+    out, rows = listing(env, "-v")
+    assert rows["secrets.age"].endswith("  default vault"), out
+    assert "CHANGED" not in out and "MISSING" not in out, out
+
+
+@go_only
+def test_describe_and_add_m(env):
+    src = env["VIAGE_TMPDIR"] + "/api-token"
+    with open(src, "w") as f:
+        f.write("tok\n")
+    status, out = run([VIAGE, "add", "-m", "API token for the build bot", src], env)
+    assert status == 0, out
+    status, out = run([VIAGE, "describe", "secrets", "day-to-day secrets"], env)
+    assert status == 0 and "described secrets.age" in out, out
+    out, rows = listing(env)
+    assert "API token" not in out and "day-to-day" not in out, out
+    out, rows = listing(env, "-v")
+    assert rows["api-token.age"].endswith("  API token for the build bot"), out
+    assert rows["secrets.age"].endswith("  day-to-day secrets"), out
+    status, out = run([VIAGE, "describe", "secrets"], env)
+    assert status == 0 and "cleared" in out, out
+    out, rows = listing(env, "-v")
+    assert rows["secrets.age"].endswith("  default vault"), out
+
+
+@go_only
+def test_list_v_detects_a_swapped_file(env):
+    add_secret(env)
+    add_secret(env, "second=1")
+    # Both are genuine ciphertexts for this identity; only the index
+    # can tell that secrets.age is not what viage last wrote.
+    shutil.copy(env["VIAGE_FILE"] + ".bak", env["VIAGE_FILE"])
+    out, rows = listing(env, "-v")
+    assert "CHANGED OUTSIDE VIAGE" in rows["secrets.age"], out
+    assert "CHANGED" not in rows["secrets.age.bak"], out
+
+
+@go_only
+def test_forged_index_is_refused(env):
+    # Encrypting to the identity needs only its public key, which anyone
+    # who learns it can do. The index must still be rejected.
+    status, out = run(["age", "-d", "-o", env["HOME"] + "/id", env["VIAGE_IDENTITY"]], env)
+    assert status == 0, out
+    recipient = subprocess.run(["age-keygen", "-y", env["HOME"] + "/id"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    os.remove(env["HOME"] + "/id")
+    forged = b'{"files": {"secrets.age": {"sha256": "00"}}, "mac": "00"}\n'
+    subprocess.run(["age", "-r", recipient, "-o", env["VIAGE_DIR"] + "/index.age"],
+                   input=forged, check=True)
+    out, rows = listing(env, "-v")
+    assert "is not authentic" in out, out
+    editor(env, 'echo x >> "$1"')
+    before = vault_state(env)
+    status, out = run([VIAGE], env)
+    assert status != 0 and "not authentic" in out and "move it out" in out, out
+    assert vault_state(env) == before
+
+
+@go_only
+def test_list_v_reports_missing_files(env):
+    src = env["VIAGE_TMPDIR"] + "/gone"
+    with open(src, "w") as f:
+        f.write("x\n")
+    status, out = run([VIAGE, "add", src], env)
+    assert status == 0, out
+    os.remove(env["VIAGE_DIR"] + "/gone.age")
+    out, rows = listing(env, "-v")
+    assert "MISSING" in rows["gone.age"], out
+
+
+@go_only
+def test_rekey_keeps_the_index(env):
+    status, out = run([VIAGE, "describe", "secrets", "day-to-day secrets"], env)
+    assert status == 0, out
+    add_secret(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0, out
+    out, rows = listing(env, "-v", passphrase=NEWPASS)
+    assert rows["secrets.age"].endswith("  day-to-day secrets"), out
+    assert "CHANGED" not in out and "not authentic" not in out, out
+
+
+@go_only
+def test_index_is_not_edited_directly(env):
+    editor(env, 'echo x >> "$1"')
+    status, out = run([VIAGE, "index"], env)
+    assert status != 0 and "describe" in out, out
+
+
+@go_only
+def test_index_adopts_an_older_vault(env):
+    add_secret(env)
+    shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/other.age")
+    os.remove(env["VIAGE_DIR"] + "/index.age")
+    out, rows = listing(env, "-v")
+    assert "index.age is missing" in out, out
+    status, out = run([VIAGE, "describe", "other", "a copy"], env)
+    assert status == 0, out
+    out, rows = listing(env, "-v")
+    assert "not in the index" not in out and "CHANGED" not in out, out
+    assert rows["other.age"].endswith("  a copy"), out
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
