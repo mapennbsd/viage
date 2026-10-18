@@ -8,6 +8,7 @@ chosen per test. Run from the repo root: python3 tests/run.py
 
 import os
 import pty
+import re
 import shutil
 import subprocess
 import sys
@@ -72,6 +73,14 @@ def plaintext(env, passphrase=PASS, path=None):
 def ram_leftovers(env):
     d = env["VIAGE_TMPDIR"]
     return [n for n in os.listdir(d) if n.startswith("viage.")]
+
+
+def vault_leftovers(env):
+    """The lock and staged files must never outlive a command."""
+    d = env["VIAGE_DIR"]
+    if not os.path.isdir(d):
+        return []
+    return [n for n in os.listdir(d) if n == ".lock" or re.fullmatch(r"\..*\.age(\.bak)?\.\w{6}", n)]
 
 
 def setup():
@@ -290,7 +299,7 @@ def test_rekey(env):
 
 def vault_state(env):
     d = env["VIAGE_DIR"]
-    return {n: read(os.path.join(d, n)) for n in sorted(os.listdir(d))}
+    return {n: read(os.path.join(d, n)) for n in sorted(os.listdir(d)) if os.path.isfile(os.path.join(d, n))}
 
 
 def test_rekey_wrong_passphrase(env):
@@ -546,6 +555,186 @@ def test_rekey_abandoned_at_new_passphrase(env):
     assert vault_state(env) == before
 
 
+# --- 0.5.0: rekey coverage, the vault lock, staging, symlinks, hardening
+
+
+def test_rekey_covers_hidden_files(env):
+    src = env["VIAGE_TMPDIR"] + "/.hidden"
+    with open(src, "w") as f:
+        f.write("hidden\n")
+    status, out = run([VIAGE, "add", src], env)
+    assert status == 0, out
+    hidden = env["VIAGE_DIR"] + "/.hidden.age"
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0 and "rekeyed " + hidden in out, out
+    assert plaintext(env, NEWPASS, hidden) == "hidden\n"
+
+
+def test_rekey_refuses_subdirectory(env):
+    sub = env["VIAGE_DIR"] + "/sub"
+    os.mkdir(sub)
+    shutil.copy(env["VIAGE_FILE"], sub + "/nested.age")
+    before = vault_state_deep(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status != 0 and "nested.age is in a subdirectory" in out, out
+    assert "passphrase" not in out.lower(), out
+    assert vault_state_deep(env) == before
+
+
+def test_rekey_refuses_default_vault_in_subdirectory(env):
+    sub = env["VIAGE_DIR"] + "/sub"
+    os.mkdir(sub)
+    shutil.move(env["VIAGE_FILE"], sub + "/secrets.age")
+    env = dict(env, VIAGE_FILE=sub + "/secrets.age")
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status != 0 and "in a subdirectory" in out, out
+
+
+def test_rekey_refuses_symlinked_vault_file(env):
+    elsewhere = env["HOME"] + "/elsewhere.age"
+    shutil.copy(env["VIAGE_FILE"], elsewhere)
+    os.symlink(elsewhere, env["VIAGE_DIR"] + "/linked.age")
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status != 0 and "linked.age is a symlink" in out, out
+
+
+def vault_state_deep(env):
+    state = {}
+    for root, _, files in os.walk(env["VIAGE_DIR"]):
+        for n in files:
+            p = os.path.join(root, n)
+            state[p] = read(p)
+    return state
+
+
+def hold_lock(env, pid):
+    os.mkdir(env["VIAGE_DIR"] + "/.lock")
+    with open(env["VIAGE_DIR"] + "/.lock/pid", "w") as f:
+        f.write(f"{pid}\n")
+
+
+def release_lock(env):
+    shutil.rmtree(env["VIAGE_DIR"] + "/.lock")
+
+
+def test_lock_refuses_writers(env):
+    hold_lock(env, os.getpid())
+    src = env["VIAGE_TMPDIR"] + "/x"
+    with open(src, "w") as f:
+        f.write("x\n")
+    before = vault_state(env)
+    editor(env, 'echo junk >> "$1"')
+    for args in ([VIAGE], [VIAGE, "add", src], [VIAGE, "rekey"]):
+        status, out = run(args, env)
+        assert status != 0 and f"in use by process {os.getpid()}" in out, (args, out)
+        assert "passphrase" not in out.lower(), out
+    assert vault_state(env) == before and os.path.exists(src)
+    # Readers do not need the lock.
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat > /dev/null'], env)
+    assert status == 0, out
+    status, out = run([VIAGE, "list"], env)
+    assert status == 0 and f"lock held by process {os.getpid()}" in out, out
+    release_lock(env)
+    os.remove(src)
+
+
+def test_stale_lock_is_reported(env):
+    p = subprocess.Popen(["true"])
+    p.wait()
+    hold_lock(env, p.pid)
+    status, out = run([VIAGE, "rekey"], env)
+    assert status != 0 and f"left by process {p.pid}, which is not running" in out, out
+    release_lock(env)
+
+
+def test_edit_holds_lock_against_rekey_and_add(env):
+    # The editor stands in for the user: while it is open, other writers
+    # are turned away, and the edit still saves.
+    src = env["VIAGE_TMPDIR"] + "/x"
+    with open(src, "w") as f:
+        f.write("x\n")
+    log = env["HOME"] + "/inner.log"
+    editor(env, f'''"{VIAGE}" rekey > "{log}" 2>&1 < /dev/null
+"{VIAGE}" add "{src}" >> "{log}" 2>&1 < /dev/null
+"{VIAGE}" >> "{log}" 2>&1 < /dev/null
+echo mine >> "$1"''')
+    status, out = run([VIAGE], env)
+    assert status == 0 and "saved" in out, out
+    inner = open(log).read()
+    assert inner.count("the vault is in use") == 3, inner
+    assert plaintext(env) == "mine\n"
+    assert os.path.exists(src) and not os.path.exists(env["VIAGE_DIR"] + "/x.age")
+    os.remove(src)
+
+
+def test_backup_symlink_is_replaced_not_followed(env):
+    add_secret(env)
+    victim = env["HOME"] + "/victim"
+    with open(victim, "w") as f:
+        f.write("do not touch\n")
+    bak = env["VIAGE_FILE"] + ".bak"
+    os.remove(bak)
+    os.symlink(victim, bak)
+    add_secret(env, "second=1")
+    assert open(victim).read() == "do not touch\n"
+    assert not os.path.islink(bak) and mode(bak) == 0o600
+    assert plaintext(env, path=bak) == "token=abc123\n"
+
+
+def test_edit_tightens_modes(env):
+    os.chmod(env["VIAGE_FILE"], 0o644)
+    add_secret(env)
+    assert mode(env["VIAGE_FILE"]) == 0o600
+    assert mode(env["VIAGE_FILE"] + ".bak") == 0o600
+
+
+def test_add_refuses_symlink_input(env):
+    target = env["VIAGE_TMPDIR"] + "/real"
+    with open(target, "w") as f:
+        f.write("plain\n")
+    link = env["VIAGE_TMPDIR"] + "/link"
+    os.symlink(target, link)
+    before = vault_state(env)
+    status, out = run([VIAGE, "add", link], env)
+    assert status != 0 and "is a symlink" in out, out
+    assert vault_state(env) == before and os.path.exists(link)
+    os.remove(link)
+    os.remove(target)
+
+
+def test_add_refuses_dangling_symlink_destination(env):
+    os.symlink(env["HOME"] + "/nowhere", env["VIAGE_DIR"] + "/x.age")
+    src = env["VIAGE_TMPDIR"] + "/x"
+    with open(src, "w") as f:
+        f.write("x\n")
+    status, out = run([VIAGE, "add", src], env)
+    assert status != 0 and "x.age exists" in out, out
+    assert not os.path.exists(env["HOME"] + "/nowhere") and os.path.exists(src)
+    os.remove(src)
+
+
+def test_unknown_filesystem_fails_closed(env):
+    # Break both ways of reading the type: stat (Linux), df (elsewhere).
+    fake = env["HOME"] + "/fakebin"
+    os.mkdir(fake)
+    for cmd in ("stat", "df"):
+        with open(fake + "/" + cmd, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(fake + "/" + cmd, 0o755)
+    env = dict(env, PATH=fake + ":" + env["PATH"])
+    editor(env, ":")
+    status, out = run([VIAGE], env)
+    assert status != 0 and "not tmpfs" in out, out
+
+
+def test_no_core_dumps(env):
+    seen = env["HOME"] + "/core"
+    editor(env, f'ulimit -c > "{seen}"')
+    status, out = run([VIAGE], env)
+    assert status == 0, out
+    assert open(seen).read().strip() == "0"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
@@ -556,6 +745,7 @@ def main():
         try:
             test(env)
             assert not ram_leftovers(env), ram_leftovers(env)
+            assert not vault_leftovers(env), vault_leftovers(env)
             print(f"ok   {test.__name__}")
         except AssertionError as e:
             failed += 1

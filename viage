@@ -21,8 +21,12 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 set -eu
+# Files viage creates are private, and a crash of viage, age or the
+# editor must not leave plaintext in a core file. Children inherit both.
+umask 077
+ulimit -c 0 2>/dev/null || :
 
-VERSION=0.4.0
+VERSION=0.5.0
 prog=viage
 
 VIAGE_DIR=${VIAGE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/viage}
@@ -94,9 +98,10 @@ is_ram() {
 	return 1
 }
 
-# Print a RAM-backed directory to hold plaintext, or fail. Where the
-# filesystem type cannot be read or proves nothing (macOS), VIAGE_TMPDIR
-# is taken on trust.
+# Print a RAM-backed directory to hold plaintext, or fail. On macOS a
+# RAM disk is an ordinary hfs or apfs volume, so VIAGE_TMPDIR is taken on
+# trust there. Anywhere else a type that is not RAM-backed, or that
+# cannot be read, is refused.
 ramdir() {
 	for d in ${VIAGE_TMPDIR:-} ${XDG_RUNTIME_DIR:-} /dev/shm /tmp; do
 		[ -d "$d" ] && [ -w "$d" ] || continue
@@ -105,10 +110,7 @@ ramdir() {
 			return
 		fi
 		[ "$d" = "${VIAGE_TMPDIR:-}" ] || continue
-		# A macOS RAM disk is an ordinary hfs or apfs volume.
-		if [ "$(uname -s)" != Darwin ] && [ -n "$(fstype "$d")" ]; then
-			die "$d is not tmpfs, ramfs or mfs"
-		fi
+		[ "$(uname -s)" = Darwin ] || die "$d is not tmpfs, ramfs or mfs"
 		printf '%s\n' "$d"
 		return
 	done
@@ -116,6 +118,7 @@ ramdir() {
 }
 
 tmp=
+lock=
 partial=
 rekeying=
 cleanup() {
@@ -124,25 +127,78 @@ cleanup() {
 	[ -n "$partial" ] && rm -f "$partial"
 	partial=
 	case $rekeying in
-	writing) rm -f "$VIAGE_IDENTITY.rekey" "$VIAGE_DIR"/*.rekey ;;
+	writing)
+		rm -f "$VIAGE_IDENTITY.rekey" "$VIAGE_DIR"/*.rekey "$VIAGE_DIR"/.*.rekey
+		;;
 	committing)
 		warn "rekey interrupted while renaming files into place."
 		warn "The old identity is $VIAGE_IDENTITY.old. Files still named *.rekey"
 		warn "are encrypted to the new identity; rename them over the originals."
+		warn "The vault stays locked until then; afterwards remove $lock."
+		lock=
 		;;
 	esac
 	rekeying=
+	[ -n "$lock" ] && rm -rf "$lock"
+	lock=
 }
 
-mktmp() {
-	umask 077
-	# Separately, so a failure here cannot leave mktemp a path on disk.
-	dir=$(ramdir) || exit 1
-	tmp=$(mktemp -d "$dir/$prog.XXXXXX") || die "mktemp failed"
+traps() {
 	trap cleanup EXIT
 	trap 'exit 129' HUP
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
+}
+
+mktmp() {
+	# Separately, so a failure here cannot leave mktemp a path on disk.
+	dir=$(ramdir) || exit 1
+	tmp=$(mktemp -d "$dir/$prog.XXXXXX") || die "mktemp failed"
+	traps
+}
+
+# Hold the vault lock until exit, as vipw locks the password file, so no
+# two commands write the vault at once. mkdir either creates the lock or
+# fails, in one step, on any filesystem including NFS. Commands that only
+# read (cat, list) do not take it.
+lock_vault() {
+	[ -d "$VIAGE_DIR" ] || die "$VIAGE_DIR not found (run $prog init)"
+	traps
+	if ! mkdir "$VIAGE_DIR/.lock" 2>/dev/null; then
+		pid=$(cat "$VIAGE_DIR/.lock/pid" 2>/dev/null) || pid=
+		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+			die "$VIAGE_DIR/.lock was left by process $pid, which is not running here; if no viage is running, remove it"
+		fi
+		die "the vault is in use${pid:+ by process $pid}; if no viage is running, remove $VIAGE_DIR/.lock"
+	fi
+	lock=$VIAGE_DIR/.lock
+	echo $$ >"$lock/pid"
+}
+
+# Copy $1 to a new file beside $2, check it byte for byte, and leave its
+# name in $partial for the caller to rename into place. mktemp makes the
+# file afresh, mode 600, so nothing planted in the directory (a symlink,
+# a file with loose permissions) can redirect or expose the write.
+stage() {
+	partial=$(mktemp "$(dirname "$2")/.${2##*/}.XXXXXX") ||
+		die "cannot create a file beside $2"
+	cp "$1" "$partial"
+	cmp -s "$1" "$partial" || die "writing $partial failed"
+}
+
+# Rename the staged file to $1, a name that must not exist yet. Renaming
+# with mv would replace $1; ln refuses to.
+publish_new() {
+	ln "$partial" "$1" 2>/dev/null || die "$1 appeared meanwhile; nothing replaced"
+	rm -f "$partial"
+	partial=
+}
+
+# Rename the staged file over $1, replacing it (even a symlink) rather
+# than writing through it.
+publish_over() {
+	mv -f "$partial" "$1"
+	partial=
 }
 
 # Print the vault file a name refers to. A name with a slash is a path;
@@ -264,21 +320,26 @@ unlock() {
 cmd_init() {
 	need age age-keygen
 	check_writable age age-keygen
-	[ -e "$VIAGE_IDENTITY" ] && die "$VIAGE_IDENTITY exists"
-	[ -e "$VIAGE_FILE" ] && die "$VIAGE_FILE exists"
+	for f in "$VIAGE_IDENTITY" "$VIAGE_FILE"; do
+		if [ -e "$f" ] || [ -L "$f" ]; then
+			die "$f exists"
+		fi
+	done
 	mktmp
 	mkdir -p "$VIAGE_DIR" "$(dirname "$VIAGE_IDENTITY")" "$(dirname "$VIAGE_FILE")"
+	lock_vault
 
 	age-keygen -o "$tmp/identity" 2>/dev/null
 	recipient=$(age-keygen -y "$tmp/identity")
 
 	printf 'Choose the vault passphrase.\n' >&2
 	# Armored, so the identity can be pasted into a password manager note.
-	age -p -a -o "$VIAGE_IDENTITY.new" "$tmp/identity" ||
-		{ rm -f "$VIAGE_IDENTITY.new"; die "identity not created"; }
-	: | age -r "$recipient" -o "$VIAGE_FILE.new"
-	mv -f "$VIAGE_IDENTITY.new" "$VIAGE_IDENTITY"
-	mv -f "$VIAGE_FILE.new" "$VIAGE_FILE"
+	age -p -a -o "$tmp/identity.age" "$tmp/identity" || die "identity not created"
+	: | age -r "$recipient" -o "$tmp/vault.age"
+	stage "$tmp/identity.age" "$VIAGE_IDENTITY"
+	publish_new "$VIAGE_IDENTITY"
+	stage "$tmp/vault.age" "$VIAGE_FILE"
+	publish_new "$VIAGE_FILE"
 
 	printf 'created %s\ncreated %s\n' "$VIAGE_IDENTITY" "$VIAGE_FILE" >&2
 	printf 'Back up the passphrase. Without it and %s the vault is lost.\n' \
@@ -291,8 +352,10 @@ cmd_edit() {
 	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
 	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found (see $prog list)"
 	mktmp
+	# For the whole session, editor included, as vipw does.
+	lock_vault
 
-	# Snapshot the ciphertext first, so a concurrent save is detected.
+	# Snapshot the ciphertext first, so a change by anything else is detected.
 	cp "$VIAGE_FILE" "$tmp/orig.age"
 
 	unlock
@@ -320,19 +383,20 @@ cmd_edit() {
 		exit 0
 	fi
 
-	new=$VIAGE_FILE.new.$$
-	age -r "$recipient" -o "$new" "$plain" ||
-		{ rm -f "$new"; die "encryption failed; vault unchanged"; }
-	# Read it back before trusting it, in case of a short write (NFS).
-	if ! age -d -i "$tmp/identity" "$new" | cmp -s - "$plain"; then
-		rm -f "$new"
+	age -r "$recipient" -o "$tmp/new.age" "$plain" ||
+		die "encryption failed; vault unchanged"
+	age -d -i "$tmp/identity" "$tmp/new.age" | cmp -s - "$plain" ||
 		die "verification failed; vault unchanged"
-	fi
 	if ! cmp -s "$tmp/orig.age" "$VIAGE_FILE"; then
+		new=$VIAGE_FILE.new.$$
+		stage "$tmp/new.age" "$VIAGE_FILE"
+		publish_over "$new"
 		die "$VIAGE_FILE changed during the edit; your version is in $new"
 	fi
-	cp -p "$VIAGE_FILE" "$VIAGE_FILE.bak"
-	mv -f "$new" "$VIAGE_FILE"
+	stage "$tmp/orig.age" "$VIAGE_FILE.bak"
+	publish_over "$VIAGE_FILE.bak"
+	stage "$tmp/new.age" "$VIAGE_FILE"
+	publish_over "$VIAGE_FILE"
 	warn "saved $VIAGE_FILE"
 }
 
@@ -402,15 +466,18 @@ cmd_add() {
 	need age age-keygen cmp
 	check_writable age age-keygen
 	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
-	[ -d "$VIAGE_DIR" ] || die "$VIAGE_DIR not found (run $prog init)"
+	mktmp
+	lock_vault
 	nl='
 '
 	seen=$nl
 	for f; do
+		# Removing a link would leave the plaintext it points to.
+		[ -L "$f" ] && die "$f is a symlink; add the file it points to"
 		[ -f "$f" ] && [ -r "$f" ] || die "$f is not a readable file"
 		[ "$f" -ef "$VIAGE_IDENTITY" ] && die "$f is the identity"
 		dest=$(add_dest "$f")
-		if [ -e "$dest" ] && ! [ "$f" -ef "$dest" ]; then
+		if { [ -e "$dest" ] || [ -L "$dest" ]; } && ! [ "$f" -ef "$dest" ]; then
 			die "$dest exists"
 		fi
 		case $seen in
@@ -418,7 +485,6 @@ cmd_add() {
 		esac
 		seen=$seen$dest$nl
 	done
-	mktmp
 
 	unlock
 	recipient=$(age-keygen -y "$tmp/identity")
@@ -463,20 +529,23 @@ cmd_add() {
 		age -r "$recipient" -o "$tmp/$n.age" "$src" || die "encryption failed for $f"
 		age -d -i "$tmp/identity" "$tmp/$n.age" | cmp -s - "$src" ||
 			die "verification failed for $f"
-		partial=$dest.add
-		cp "$tmp/$n.age" "$partial"
-		cmp -s "$tmp/$n.age" "$partial" || die "writing $partial failed"
-		mv -f "$partial" "$dest"
-		partial=
-
+		stage "$tmp/$n.age" "$dest"
 		if [ -n "$inplace" ]; then
+			publish_over "$dest"
 			warn "re-encrypted $dest to the vault identity"
-		elif [ -n "$keep" ]; then
-			warn "added $dest; kept $f"
-		elif rm -f "$f"; then
-			warn "added $dest; removed $f"
 		else
-			warn "added $dest; could not remove $f"
+			publish_new "$dest"
+			if [ -n "$keep" ]; then
+				warn "added $dest; kept $f"
+			else
+				# The vault copy must be on disk before the original goes.
+				sync
+				if rm -f "$f"; then
+					warn "added $dest; removed $f"
+				else
+					warn "added $dest; could not remove $f"
+				fi
+			fi
 		fi
 		if [ -n "$exposed" ]; then
 			warn "warning: $f was plaintext on persistent storage. Deleting it does"
@@ -492,10 +561,13 @@ cmd_list() {
 	[ -d "$VIAGE_DIR" ] || die "$VIAGE_DIR not found (run $prog init)"
 	m=$(loose_mode "$VIAGE_DIR")
 	[ -z "$m" ] || warn "warning: $VIAGE_DIR is open to others ($m); chmod 700 it"
-	for f in "$VIAGE_DIR"/* "$VIAGE_DIR"/.[!.]*; do
+	for f in "$VIAGE_DIR"/* "$VIAGE_DIR"/.[!.]* "$VIAGE_DIR"/..?*; do
 		[ -e "$f" ] || [ -L "$f" ] || continue
 		name=${f##*/}
-		if [ -L "$f" ] || ! [ -f "$f" ]; then
+		if [ "$f" = "$VIAGE_DIR/.lock" ]; then
+			pid=$(cat "$f/pid" 2>/dev/null) || pid=
+			note="lock held${pid:+ by process $pid}"
+		elif [ -L "$f" ] || ! [ -f "$f" ]; then
 			note="not a regular file"
 		elif [ "$f" -ef "$VIAGE_IDENTITY" ]; then
 			note="identity"
@@ -503,7 +575,9 @@ cmd_list() {
 			case $name in
 			*.new.*) note="unsaved edit; recover or remove it" ;;
 			*.rekey | *.old) note="left by an unfinished rekey" ;;
-			*.add) note="left by an interrupted add; remove it" ;;
+			.*.age.?????? | .*.age.bak.??????)
+				note="left by an interrupted $prog; remove it"
+				;;
 			*)
 				case $(age_kind "$f") in
 				x25519 | armored)
@@ -534,15 +608,20 @@ cmd_list() {
 }
 
 # Replace the identity with a new one under a new passphrase and
-# re-encrypt every vault file in VIAGE_DIR (*.age and *.age.bak) to it.
-# Files that are not encrypted to the identity are skipped with a
-# warning. Everything is written and checked before anything is renamed
-# into place. Copies of the old identity elsewhere (snapshots, backups)
-# still open the files as they were before, with the old passphrase.
+# re-encrypt every vault file to it: each *.age and *.age.bak directly in
+# VIAGE_DIR, hidden ones included. Anything rekey cannot cover (a vault
+# file in a subdirectory or behind a symlink, the default vault outside
+# VIAGE_DIR) stops it before it starts, since the old identity is deleted
+# at the end. Files that are not encrypted to the identity are skipped
+# with a warning. Everything is written and checked before anything is
+# renamed into place. Copies of the old identity elsewhere (snapshots,
+# backups) still open the files as they were before.
 cmd_rekey() {
 	need age age-keygen cmp
 	check_writable age age-keygen
 	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
+	mktmp
+	lock_vault
 	case $VIAGE_FILE in
 	"$VIAGE_DIR"/*) ;;
 	*)
@@ -551,14 +630,30 @@ cmd_rekey() {
 		fi
 		;;
 	esac
-	for f in "$VIAGE_IDENTITY.old" "$VIAGE_IDENTITY.rekey" "$VIAGE_DIR"/*.rekey; do
-		[ -e "$f" ] && die "$f exists; a previous rekey did not finish"
+	for f in "$VIAGE_IDENTITY.old" "$VIAGE_IDENTITY.rekey" \
+		"$VIAGE_DIR"/*.rekey "$VIAGE_DIR"/.*.rekey; do
+		if [ -e "$f" ] || [ -L "$f" ]; then
+			die "$f exists; a previous rekey did not finish"
+		fi
 	done
-	for f in "$VIAGE_DIR"/*.new.*; do
+	for f in "$VIAGE_DIR"/*.new.* "$VIAGE_DIR"/.*.new.*; do
 		[ -e "$f" ] && die "$f holds an unsaved edit; recover or remove it first"
 	done
 	set --
-	for f in "$VIAGE_DIR"/*.age "$VIAGE_DIR"/*.age.bak; do
+	for f in "$VIAGE_DIR"/* "$VIAGE_DIR"/.[!.]* "$VIAGE_DIR"/..?*; do
+		[ -e "$f" ] || [ -L "$f" ] || continue
+		[ "$f" = "$VIAGE_DIR/.lock" ] && continue
+		if [ -d "$f" ] && ! [ -L "$f" ]; then
+			x=$(find "$f" \( -name '*.age' -o -name '*.age.bak' \) -print | sed -n 1p)
+			[ -z "$x" ] ||
+				die "$x is in a subdirectory, which rekey does not cover; move it into $VIAGE_DIR or out of it"
+			continue
+		fi
+		case ${f##*/} in
+		*.age | *.age.bak) ;;
+		*) continue ;;
+		esac
+		[ -L "$f" ] && die "$f is a symlink, which rekey does not follow; replace it with the file"
 		[ -f "$f" ] && ! [ "$f" -ef "$VIAGE_IDENTITY" ] || continue
 		case $(age_kind "$f") in
 		x25519 | armored) set -- "$@" "$f" ;;
@@ -568,7 +663,6 @@ cmd_rekey() {
 		esac
 	done
 	[ $# -gt 0 ] || die "no vault files in $VIAGE_DIR"
-	mktmp
 
 	unlock
 	# Keep only the files the identity opens, numbered in order.
@@ -600,24 +694,25 @@ cmd_rekey() {
 	# Encrypt and verify in RAM, then copy beside the originals and
 	# compare byte for byte, in case of a short write (NFS).
 	rekeying=writing
-	cp "$tmp/new.age" "$VIAGE_IDENTITY.rekey"
-	cmp -s "$tmp/new.age" "$VIAGE_IDENTITY.rekey" ||
-		die "writing $VIAGE_IDENTITY.rekey failed; nothing changed"
+	stage "$tmp/new.age" "$VIAGE_IDENTITY"
+	publish_over "$VIAGE_IDENTITY.rekey"
 	n=0
 	for f; do
 		n=$((n + 1))
 		age -r "$recipient" -o "$tmp/$n.new" "$tmp/$n"
 		age -d -i "$tmp/new" "$tmp/$n.new" | cmp -s - "$tmp/$n" ||
 			die "verification failed for $f; nothing changed"
-		cp "$tmp/$n.new" "$f.rekey"
-		cmp -s "$tmp/$n.new" "$f.rekey" ||
-			die "writing $f.rekey failed; nothing changed"
+		stage "$tmp/$n.new" "$f"
+		publish_over "$f.rekey"
 		cmp -s "$tmp/$n.age" "$f" ||
 			die "$f changed during the rekey; nothing changed"
 	done
 
 	# The identity goes first and the old one is kept until every file
-	# is in place, so an interruption leaves something recoverable.
+	# is in place, so an interruption leaves something recoverable. The
+	# new files must be on disk before the renames, and the renames
+	# before the old identity goes.
+	sync
 	trap '' HUP INT TERM
 	rekeying=committing
 	mv -f "$VIAGE_IDENTITY" "$VIAGE_IDENTITY.old"
@@ -625,6 +720,7 @@ cmd_rekey() {
 	for f; do
 		mv -f "$f.rekey" "$f"
 	done
+	sync
 	rm -f "$VIAGE_IDENTITY.old"
 	rekeying=
 

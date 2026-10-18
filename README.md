@@ -157,11 +157,21 @@ If the content did not change, the file is not rewritten. A file that
 holds binary data, such as a LUKS header, is not opened in the editor;
 use `viage cat` to get it out.
 
+Like `vipw`, viage writes the vault one command at a time. `edit`, `add`,
+`rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
+finish; an edit holds it for as long as the editor is open. Another
+writer started meanwhile stops with "the vault is in use". Reading
+(`cat`, `list`) needs no lock. If viage was killed and left the lock
+behind, it says which process held it; remove the directory once no
+viage is running.
+
 ### What belongs in the vault
 
 Every file in `$VIAGE_DIR` should be encrypted to the vault identity, so
 that one passphrase opens all of it and `rekey` covers all of it. Keep
-files under other keys somewhere else. For a separate compartment, with
+files under other keys somewhere else, and keep vault files directly in
+`$VIAGE_DIR`, not in subdirectories or behind symlinks; rekey refuses to
+run while any are there. For a separate compartment, with
 its own passphrase, make a second vault: another directory with its own
 `identity.age`, used with `VIAGE_DIR=... viage`.
 
@@ -170,7 +180,9 @@ its own passphrase, make a second vault: another directory with its own
 `viage add` encrypts each file to the identity, writes it into
 `$VIAGE_DIR` as `name.age`, reads it back to verify it, and then removes
 the original (`-k` keeps it). Every file is checked before the first is
-written, and an existing vault file is never overwritten.
+written, and an existing vault file is never overwritten. A symlink is
+refused, because deleting the link would leave the plaintext it points
+to; add the file itself.
 
 A file that is already age-encrypted is decrypted first and re-encrypted
 to the identity. If it has a passphrase of its own, age asks for it. That
@@ -194,11 +206,11 @@ viage add /run/user/1000/root.luks-header
 
 `viage list` shows each file with its size and date, labels the identity,
 the default vault (`$VIAGE_FILE`) and the previous versions that edit
-keeps (`*.age.bak`), and flags anything
-that does not belong: a file that is not encrypted at all, a file with a
-passphrase of its own, a file or directory open to other users, and
-leftovers from an interrupted edit, add or rekey. It reads only the age
-headers and asks for no passphrase. A header shows whether a file has its
+keeps (`*.age.bak`), and flags anything that does not belong: a file
+that is not encrypted at all, a file with a passphrase of its own, a
+file or directory open to other users, a held lock, and leftovers from
+an interrupted edit, add or rekey. It reads only the age headers and
+asks for no passphrase. A header shows whether a file has its
 own passphrase or is encrypted to a key, but not which key; only `cat` or
 `rekey` can confirm a file opens with the identity.
 
@@ -247,7 +259,8 @@ passphrase from the terminal.
 ### Changing the passphrase
 
 `viage rekey` makes a new identity under a new passphrase and re-encrypts
-every `*.age` and `*.age.bak` file in `$VIAGE_DIR` to it. The old identity
+every `*.age` and `*.age.bak` file in `$VIAGE_DIR` to it, hidden files
+included. The old identity
 is replaced, not re-wrapped, because changing only the passphrase would
 not revoke the old one. Every copy of the old `identity.age` (snapshots,
 backups, a file server) would still open with the old passphrase, and it
@@ -259,7 +272,8 @@ old passphrase may be known, rotate the secrets themselves.
 
 Each file is decrypted, re-encrypted, verified in RAM, written beside the
 original as `*.rekey` and compared byte for byte before anything is
-renamed. If anything fails, nothing changes.
+renamed. A failure up to that point changes nothing: the `*.rekey` files
+are removed and the vault is as it was.
 
 A file in `$VIAGE_DIR` that the identity does not open is skipped with a
 warning and left as it is: one with its own passphrase (bring it in with
@@ -267,14 +281,32 @@ warning and left as it is: one with its own passphrase (bring it in with
 Skipping is safe, because a file the old identity cannot open is not
 exposed by it either. Rekey refuses to start when:
 
+- a vault file is in a subdirectory or is a symlink, or the default vault
+  is outside `$VIAGE_DIR` (rekey could not cover it, and the old identity
+  is deleted at the end),
 - an unsaved edit (`*.new.*`) is waiting, or
 - a previous rekey did not finish.
 
-The identity is renamed into place first and the old one is kept as
-`identity.age.old` until every file is in place, so an interruption leaves
-a state you can recover by hand. Files outside `$VIAGE_DIR` are not found;
-keep the vault files together. Afterwards, update every copy of the
-passphrase and of `identity.age` you keep elsewhere.
+Then the files are renamed into place, the identity first. Signals are
+ignored during the renames, but a crash, a power loss or a failing disk
+can still stop them partway. The old identity is kept as
+`identity.age.old` until every file is in place, so that state can be
+recovered by hand, and the vault stays locked until it is:
+
+- If `identity.age` is missing, rename `identity.age.rekey` to it.
+- `identity.age` is then the new identity, and `identity.age.old` the old
+  one.
+- A file still named `X.age.rekey` is the new version of `X.age`; rename
+  it over `X.age`.
+- When no `*.rekey` file is left, remove `identity.age.old` and
+  `$VIAGE_DIR/.lock`.
+
+If the old passphrase still opens `identity.age`, the renames never
+started: remove `identity.age.rekey`, every `*.rekey` and the lock, and
+the vault is as it was.
+
+Afterwards, update every copy of the passphrase and of `identity.age`
+you keep elsewhere.
 
 | Variable | Default |
 |---|---|
@@ -286,17 +318,22 @@ passphrase and of `identity.age` you keep elsewhere.
 
 ## How it works
 
-1. Copy the ciphertext aside, to detect a concurrent save later.
+1. Take the vault lock, and copy the ciphertext aside to detect a change
+   by anything else later.
 2. Decrypt `identity.age` (the only prompt) into a private directory on
    tmpfs. The recipient is derived from it each time rather than read from
    a file, so a writable vault directory cannot redirect encryption to
    someone else's key.
 3. Decrypt the vault next to it and run the editor.
-4. If the content changed: encrypt to a new file beside the vault, decrypt
-   it again and compare, check that nobody else saved in the meantime, keep
-   the previous ciphertext as `secrets.age.bak`, then rename the new file
-   into place.
-5. Remove the private directory, on any exit.
+4. If the content changed: encrypt it in the private directory, decrypt
+   it again and compare, and check the vault was not changed meanwhile.
+   Copy the previous ciphertext to a new file beside the vault and rename
+   it to `secrets.age.bak`, then do the same with the new ciphertext and
+   `secrets.age`. Each copy goes to a file made fresh by `mktemp`, mode
+   600, and renaming replaces the old name rather than writing through
+   it, so a symlink planted in the vault directory cannot redirect a
+   write.
+5. Remove the private directory and the lock, on any exit.
 
 ## What it protects against, and what it does not
 
@@ -314,6 +351,10 @@ Points to be aware of:
 - **Swap.** tmpfs pages can be swapped out. Use encrypted swap, or zram
   only. OpenBSD encrypts swap by default; on FreeBSD use an `.eli` swap
   device.
+- **Core dumps.** viage sets the core size limit to 0, and the editor and
+  age inherit it, so a crash does not write their memory, plaintext
+  included, to a core file. systemd-coredump honors the limit: it logs
+  the crash and stores no core.
 - **The editor.** vim and neovim are started with `--clean -n -i NONE` and
   undo, backup and write-backup files turned off: no swap file, no history
   file, and no user config or plugins. Other editors are run as they are,
@@ -329,9 +370,15 @@ Points to be aware of:
   cannot forge or alter it.
 - **Platforms.** viage checks that the plaintext directory is RAM-backed:
   tmpfs or ramfs on Linux, tmpfs on FreeBSD, mfs on OpenBSD (a tmpfs or
-  mfs `/tmp` is found by itself). On macOS a RAM disk looks like any other
-  volume, so `VIAGE_TMPDIR` must be set and you vouch for it. Tested on
-  Linux; the BSD checks are tested by simulation only so far.
+  mfs `/tmp` is found by itself). If the type cannot be read, it refuses.
+  On macOS a RAM disk looks like any other volume, so `VIAGE_TMPDIR` must
+  be set and you vouch for it. Tested on Linux; the BSD checks are tested
+  by simulation only so far.
+- **Changing a file while adding it.** The lock keeps viage commands
+  apart, not other programs. If a file is changed by something else while
+  `viage add` is working on it, the vault may get the earlier version and
+  the original is still removed. Do not add a file that is still being
+  written.
 - **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
   Its working file goes to the private directory, but if it is killed or
   the terminal hangs up, it saves a recovery copy, in plaintext, to
