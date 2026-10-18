@@ -1,14 +1,14 @@
 #!/bin/sh
-# viage - edit an age-encrypted file, vipw style.
+# viage - keep secrets in age-encrypted files, edited vipw style.
 #
-# The vault is encrypted to an age identity, and the identity is itself
-# encrypted with a passphrase. Each edit asks for the passphrase once,
-# decrypts into a RAM-backed directory, runs the editor and re-encrypts.
-# Plaintext never touches persistent storage.
+# The vault is a directory of files encrypted to one age identity, and
+# the identity is itself encrypted with a passphrase. Each command asks
+# for the passphrase once and handles plaintext only in a RAM-backed
+# directory. Plaintext never touches persistent storage.
 
 set -eu
 
-VERSION=0.2.0
+VERSION=0.4.0
 prog=viage
 
 VIAGE_DIR=${VIAGE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/viage}
@@ -18,17 +18,25 @@ editor=${VIAGE_EDITOR:-${VISUAL:-${EDITOR:-vi}}}
 
 usage() {
 	cat <<EOF
-usage: $prog [file]      edit the vault (default: \$VIAGE_FILE)
-       $prog init        create the identity and an empty vault
+usage: $prog [name]            edit a vault file (default: \$VIAGE_FILE)
+       $prog cat [name]        print a vault file to stdout
+       $prog add [-k] file...  encrypt files into the vault, then remove them
+       $prog list              show what is in the vault
+       $prog init              create the identity and an empty vault
+       $prog rekey             new identity and passphrase; re-encrypt the vault
        $prog -h | -V
+
+A name without a slash is a file in \$VIAGE_DIR, with .age added if missing.
 
   VIAGE_DIR       $VIAGE_DIR
   VIAGE_IDENTITY  $VIAGE_IDENTITY
   VIAGE_FILE      $VIAGE_FILE
-  VIAGE_TMPDIR    RAM-backed directory for plaintext (required off Linux)
+  VIAGE_TMPDIR    RAM-backed directory for plaintext
   VIAGE_EDITOR    editor command (default: \$VISUAL, \$EDITOR, vi)
 
 Exit the editor with an error (:cq in vi) to discard changes.
+In vim or neovim on Wayland, Y in visual mode copies the selection with
+wl-copy --sensitive, which clipboard managers are asked not to record.
 EOF
 }
 
@@ -47,42 +55,133 @@ need() {
 	done
 }
 
-# Print a RAM-backed directory to hold plaintext, or fail. On Linux the
-# filesystem type is checked; elsewhere VIAGE_TMPDIR must be set and the
-# user vouches for it.
-ramdir() {
-	if [ "$(uname -s)" != Linux ]; then
-		[ -n "${VIAGE_TMPDIR:-}" ] ||
-			die "set VIAGE_TMPDIR to a RAM-backed directory on $(uname -s)"
-		printf '%s\n' "$VIAGE_TMPDIR"
-		return
+# Print the type of the filesystem holding $1, or nothing if unknown.
+fstype() {
+	if [ "$(uname -s)" = Linux ]; then
+		stat -f -c %T "$1" 2>/dev/null || :
+		return 0
 	fi
-	for d in ${VIAGE_TMPDIR:-} ${XDG_RUNTIME_DIR:-} /dev/shm; do
+	# Elsewhere, find the mount point and look it up in mount(8). OpenBSD
+	# prints "dev on /mnt type mfs (...)", FreeBSD and macOS print
+	# "dev on /mnt (tmpfs, local)".
+	mp=$(df -P "$1" 2>/dev/null | awk 'NR == 2 { print $NF }')
+	[ -n "$mp" ] || return 0
+	mount | awk -v mp="$mp" '$2 == "on" && $3 == mp {
+		if ($4 == "type") print $5
+		else { t = $4; gsub(/[(,]/, "", t); print t }
+	}' | tail -n 1
+}
+
+# True if $1 is on a RAM-backed filesystem, as far as can be told.
+is_ram() {
+	case $(fstype "$1") in
+	tmpfs | ramfs | mfs) return 0 ;;
+	esac
+	return 1
+}
+
+# Print a RAM-backed directory to hold plaintext, or fail. Where the
+# filesystem type cannot be read or proves nothing (macOS), VIAGE_TMPDIR
+# is taken on trust.
+ramdir() {
+	for d in ${VIAGE_TMPDIR:-} ${XDG_RUNTIME_DIR:-} /dev/shm /tmp; do
 		[ -d "$d" ] && [ -w "$d" ] || continue
-		case $(stat -f -c %T "$d" 2>/dev/null) in
-		tmpfs | ramfs)
+		if is_ram "$d"; then
 			printf '%s\n' "$d"
 			return
-			;;
-		esac
-		[ "$d" = "${VIAGE_TMPDIR:-}" ] && die "$d is not tmpfs or ramfs"
+		fi
+		[ "$d" = "${VIAGE_TMPDIR:-}" ] || continue
+		# A macOS RAM disk is an ordinary hfs or apfs volume.
+		if [ "$(uname -s)" != Darwin ] && [ -n "$(fstype "$d")" ]; then
+			die "$d is not tmpfs, ramfs or mfs"
+		fi
+		printf '%s\n' "$d"
+		return
 	done
 	die "no RAM-backed directory found; set VIAGE_TMPDIR"
 }
 
 tmp=
+partial=
+rekeying=
 cleanup() {
 	[ -n "$tmp" ] && rm -rf "$tmp"
 	tmp=
+	[ -n "$partial" ] && rm -f "$partial"
+	partial=
+	case $rekeying in
+	writing) rm -f "$VIAGE_IDENTITY.rekey" "$VIAGE_DIR"/*.rekey ;;
+	committing)
+		warn "rekey interrupted while renaming files into place."
+		warn "The old identity is $VIAGE_IDENTITY.old. Files still named *.rekey"
+		warn "are encrypted to the new identity; rename them over the originals."
+		;;
+	esac
+	rekeying=
 }
 
 mktmp() {
 	umask 077
-	tmp=$(mktemp -d "$(ramdir)/$prog.XXXXXX") || die "mktemp failed"
+	# Separately, so a failure here cannot leave mktemp a path on disk.
+	dir=$(ramdir) || exit 1
+	tmp=$(mktemp -d "$dir/$prog.XXXXXX") || die "mktemp failed"
 	trap cleanup EXIT
 	trap 'exit 129' HUP
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
+}
+
+# Print the vault file a name refers to. A name with a slash is a path;
+# anything else is a file in VIAGE_DIR, with .age added if missing.
+resolve() {
+	case $1 in
+	*/*) printf '%s\n' "$1" ;;
+	*.age | *.age.bak) printf '%s\n' "$VIAGE_DIR/$1" ;;
+	*) printf '%s\n' "$VIAGE_DIR/$1.age" ;;
+	esac
+}
+
+# Print what protects a file, read from its age header without
+# decrypting: scrypt (a passphrase of its own), x25519 (a key, perhaps
+# the identity), another stanza type, "armored" for armor that cannot
+# be decoded here, or "none" for a file that is not age-encrypted.
+age_kind() {
+	head=$(dd if="$1" bs=1024 count=1 2>/dev/null | LC_ALL=C tr -c '\n[:print:]' '?')
+	case $head in
+	'-----BEGIN AGE ENCRYPTED FILE-----'*)
+		head=$(sed -n '2,20{/^-----/q;p;}' "$1" | base64 -d 2>/dev/null |
+			LC_ALL=C tr -c '\n[:print:]' '?')
+		case $head in
+		age-encryption.org/v1*) ;;
+		*)
+			echo armored
+			return 0
+			;;
+		esac
+		;;
+	age-encryption.org/v1*) ;;
+	*)
+		echo none
+		return 0
+		;;
+	esac
+	stanzas=$(printf '%s\n' "$head" | sed -n 's/^-> \([^ ]*\).*/\1/p')
+	if printf '%s\n' "$stanzas" | grep -qx scrypt; then
+		echo scrypt
+	elif printf '%s\n' "$stanzas" | grep -qx X25519; then
+		echo x25519
+	else
+		printf '%s\n' "${stanzas:-unknown}" | sed -n 1p
+	fi
+}
+
+# Print the mode of $1 if anyone but its owner has access to it.
+loose_mode() {
+	m=$(ls -ld "$1")
+	case $m in
+	????------*) ;;
+	*) printf '%s\n' "${m%% *}" ;;
+	esac
 }
 
 # Run the editor on $1 with swap, undo, backup and history files turned
@@ -90,6 +189,12 @@ mktmp() {
 # nothing (an LSP, an AI completion plugin) gets to read the buffer.
 edit() {
 	off='set noundofile nobackup nowritebackup'
+	# Y copies the visual selection, minus trailing newlines, marked
+	# sensitive so a clipboard history that honors the hint (Omarchy's
+	# does) skips it. The default yank stays in the editor's registers.
+	copy='echo'
+	command -v wl-copy >/dev/null 2>&1 &&
+		copy='xnoremap Y y:call system("wl-copy --sensitive", trim(@", "\n", 2))<Bar>echo v:shell_error ? "wl-copy failed; nothing copied" : "copied (sensitive)"<CR>'
 	# Word splitting is wanted: EDITOR may carry arguments.
 	# shellcheck disable=SC2086
 	set -- "$1" $editor
@@ -99,10 +204,10 @@ edit() {
 	nvim | vim | vi)
 		# vi may be nvi or busybox, which do not know these flags.
 		if [ "${1##*/}" = vi ] && ! "$1" --version 2>/dev/null | grep -Eq '^N?VIM'; then
-			warn "unknown vi; check it writes no swap or backup files"
+			warn "unknown vi; check it writes no swap, backup or recovery files"
 			TMPDIR=$tmp "$@" "$file"
 		else
-			TMPDIR=$tmp "$@" --clean -n -i NONE -c "$off" "$file"
+			TMPDIR=$tmp "$@" --clean -n -i NONE -c "$off" -c "$copy" "$file"
 		fi
 		;;
 	*)
@@ -114,15 +219,16 @@ edit() {
 
 # Warn about each program viage is about to trust with the passphrase or
 # the plaintext that a process running as you could replace: the script
-# itself, age, and the editor. Being writable by you is how an agent or
-# other same-user process would swap in a version that keeps a copy. This
-# cannot stop a replaced viage (it would drop the check), but it does flag
-# a writable install and a substituted age or editor.
+# itself and the commands given (age, the editor). Being writable by you
+# is how an agent or other same-user process would swap in a version that
+# keeps a copy. This cannot stop a replaced viage (it would drop the
+# check), but it does flag a writable install and a substituted age or
+# editor.
 check_writable() {
 	[ "$(id -u)" -eq 0 ] && return 0
 	# $0 is the script as run, even "sh viage"; do not look it up in PATH.
 	[ -f "$0" ] && writable "$0"
-	for c in age age-keygen "${editor%% *}"; do
+	for c; do
 		p=$(command -v "$c" 2>/dev/null) || continue
 		case $p in */*) writable "$p" ;; esac
 	done
@@ -137,9 +243,13 @@ writable() {
 	fi
 }
 
+unlock() {
+	age -d -o "$tmp/identity" "$VIAGE_IDENTITY" || die "cannot unlock identity"
+}
+
 cmd_init() {
 	need age age-keygen
-	check_writable
+	check_writable age age-keygen
 	[ -e "$VIAGE_IDENTITY" ] && die "$VIAGE_IDENTITY exists"
 	[ -e "$VIAGE_FILE" ] && die "$VIAGE_FILE exists"
 	mktmp
@@ -163,20 +273,23 @@ cmd_init() {
 
 cmd_edit() {
 	need age age-keygen cmp
-	check_writable
+	check_writable age age-keygen "${editor%% *}"
 	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
-	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found"
+	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found (see $prog list)"
 	mktmp
 
 	# Snapshot the ciphertext first, so a concurrent save is detected.
 	cp "$VIAGE_FILE" "$tmp/orig.age"
 
-	age -d -o "$tmp/identity" "$VIAGE_IDENTITY" || die "cannot unlock identity"
+	unlock
 	# Derive the recipient from the identity every time. A recipient file
 	# on shared storage could be swapped for someone else's key.
 	recipient=$(age-keygen -y "$tmp/identity")
 	age -d -i "$tmp/identity" -o "$tmp/orig" "$tmp/orig.age" ||
 		die "cannot decrypt $VIAGE_FILE"
+	if ! LC_ALL=C tr -d '\000' <"$tmp/orig" | cmp -s - "$tmp/orig"; then
+		die "$VIAGE_FILE holds binary data; use $prog cat to get it out"
+	fi
 	cp "$tmp/orig" "$tmp/${VIAGE_FILE##*/}.txt"
 	plain=$tmp/${VIAGE_FILE##*/}.txt
 
@@ -209,6 +322,307 @@ cmd_edit() {
 	warn "saved $VIAGE_FILE"
 }
 
+# Say where cat's output is going and what will keep a copy of it.
+# Printed before the passphrase prompt, so there is time to ^C.
+cat_warning() {
+	if [ -t 1 ]; then
+		warn "warning: printing plaintext to the terminal. Scrollback, a"
+		warn "multiplexer log, or an agent reading this terminal can keep it."
+		return
+	fi
+	out=$(readlink "/proc/$$/fd/1" 2>/dev/null) || out=
+	case $out in
+	'')
+		warn "warning: plaintext goes wherever stdout leads; a file on disk"
+		warn "outlives this command, in backups and snapshots too."
+		;;
+	/*)
+		[ -c "$out" ] && return 0
+		if is_ram "$out"; then
+			warn "warning: writing plaintext to $out (RAM-backed); remove it when done."
+		else
+			warn "warning: writing plaintext to $out on persistent storage. It"
+			warn "outlives this command, in backups and snapshots too."
+		fi
+		;;
+	*)
+		warn "warning: plaintext goes to a pipe, and the reader decides where it"
+		warn "ends up. To copy, use wl-copy --sensitive, not plain wl-copy."
+		;;
+	esac
+}
+
+cmd_cat() {
+	need age
+	check_writable age
+	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
+	[ -f "$VIAGE_FILE" ] || die "$VIAGE_FILE not found (see $prog list)"
+	cat_warning
+	mktmp
+	unlock
+	age -d -i "$tmp/identity" "$VIAGE_FILE" || die "cannot decrypt $VIAGE_FILE"
+}
+
+# The vault file that "add" writes for $1.
+add_dest() {
+	b=${1##*/}
+	case $b in
+	*.age) ;;
+	*) b=$b.age ;;
+	esac
+	printf '%s\n' "$VIAGE_DIR/$b"
+}
+
+# Encrypt files into the vault and remove the originals (-k keeps them).
+# A file that is already age-encrypted, with its own passphrase or to the
+# identity, is decrypted and re-encrypted to the identity; that is how an
+# out-of-band file comes under viage, in place if it is in VIAGE_DIR.
+# Every file is checked and decrypted before anything is written.
+cmd_add() {
+	keep=
+	if [ "${1:-}" = -k ]; then
+		keep=1
+		shift
+	fi
+	[ $# -gt 0 ] || { usage >&2; exit 2; }
+	need age age-keygen cmp
+	check_writable age age-keygen
+	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
+	[ -d "$VIAGE_DIR" ] || die "$VIAGE_DIR not found (run $prog init)"
+	nl='
+'
+	seen=$nl
+	for f; do
+		[ -f "$f" ] && [ -r "$f" ] || die "$f is not a readable file"
+		[ "$f" -ef "$VIAGE_IDENTITY" ] && die "$f is the identity"
+		dest=$(add_dest "$f")
+		if [ -e "$dest" ] && ! [ "$f" -ef "$dest" ]; then
+			die "$dest exists"
+		fi
+		case $seen in
+		*"$nl$dest$nl"*) die "two files would be added as $dest" ;;
+		esac
+		seen=$seen$dest$nl
+	done
+	mktmp
+
+	unlock
+	recipient=$(age-keygen -y "$tmp/identity")
+	n=0
+	for f; do
+		n=$((n + 1))
+		case $(age_kind "$f") in
+		none) ;;
+		scrypt)
+			warn "$f has a passphrase of its own; enter it to bring the file in."
+			age -d -o "$tmp/$n.plain" "$f" || die "cannot decrypt $f; nothing added"
+			;;
+		*)
+			age -d -i "$tmp/identity" -o "$tmp/$n.plain" "$f" 2>/dev/null ||
+				die "$f is encrypted to another key; nothing added"
+			if [ "$f" -ef "$(add_dest "$f")" ]; then
+				: >"$tmp/$n.skip"
+			fi
+			;;
+		esac
+	done
+
+	n=0
+	for f; do
+		n=$((n + 1))
+		dest=$(add_dest "$f")
+		if [ -e "$tmp/$n.skip" ]; then
+			warn "$dest is already in the vault"
+			continue
+		fi
+		src=$f
+		[ -e "$tmp/$n.plain" ] && src=$tmp/$n.plain
+		exposed=
+		if [ "$src" = "$f" ] && ! is_ram "$f"; then
+			exposed=1
+		fi
+		inplace=
+		if [ "$f" -ef "$dest" ]; then
+			inplace=1
+		fi
+
+		age -r "$recipient" -o "$tmp/$n.age" "$src" || die "encryption failed for $f"
+		age -d -i "$tmp/identity" "$tmp/$n.age" | cmp -s - "$src" ||
+			die "verification failed for $f"
+		partial=$dest.add
+		cp "$tmp/$n.age" "$partial"
+		cmp -s "$tmp/$n.age" "$partial" || die "writing $partial failed"
+		mv -f "$partial" "$dest"
+		partial=
+
+		if [ -n "$inplace" ]; then
+			warn "re-encrypted $dest to the vault identity"
+		elif [ -n "$keep" ]; then
+			warn "added $dest; kept $f"
+		elif rm -f "$f"; then
+			warn "added $dest; removed $f"
+		else
+			warn "added $dest; could not remove $f"
+		fi
+		if [ -n "$exposed" ]; then
+			warn "warning: $f was plaintext on persistent storage. Deleting it does"
+			warn "not reach the snapshots and backups that already copied it."
+		fi
+	done
+}
+
+# List the vault directory. Nothing is decrypted and no passphrase is
+# asked for; the age header tells a file with its own passphrase from
+# one encrypted to a key, but not which key.
+cmd_list() {
+	[ -d "$VIAGE_DIR" ] || die "$VIAGE_DIR not found (run $prog init)"
+	m=$(loose_mode "$VIAGE_DIR")
+	[ -z "$m" ] || warn "warning: $VIAGE_DIR is open to others ($m); chmod 700 it"
+	for f in "$VIAGE_DIR"/* "$VIAGE_DIR"/.[!.]*; do
+		[ -e "$f" ] || [ -L "$f" ] || continue
+		name=${f##*/}
+		if [ -L "$f" ] || ! [ -f "$f" ]; then
+			note="not a regular file"
+		elif [ "$f" -ef "$VIAGE_IDENTITY" ]; then
+			note="identity"
+		else
+			case $name in
+			*.new.*) note="unsaved edit; recover or remove it" ;;
+			*.rekey | *.old) note="left by an unfinished rekey" ;;
+			*.add) note="left by an interrupted add; remove it" ;;
+			*)
+				case $(age_kind "$f") in
+				x25519 | armored)
+					note=
+					if [ "$f" -ef "$VIAGE_FILE" ]; then
+						note="default vault"
+					else
+						case $name in
+						*.age.bak) note="previous version of ${name%.bak}" ;;
+						esac
+					fi
+					;;
+				scrypt) note="own passphrase; rekey skips it ($prog add brings it in)" ;;
+				none) note="NOT ENCRYPTED" ;;
+				*) note="another kind of key; rekey skips it" ;;
+				esac
+				;;
+			esac
+		fi
+		m=
+		[ -L "$f" ] || m=$(loose_mode "$f")
+		[ -z "$m" ] || note="${note:+$note; }open to others ($m)"
+		size=-
+		[ -L "$f" ] || ! [ -f "$f" ] || size=$(wc -c <"$f" | tr -d ' ')
+		date=$(ls -lnd "$f" | awk '{ print $6, $7, $8 }')
+		printf '%-32s %10s  %-12s  %s\n' "$name" "$size" "$date" "$note"
+	done
+}
+
+# Replace the identity with a new one under a new passphrase and
+# re-encrypt every vault file in VIAGE_DIR (*.age and *.age.bak) to it.
+# Files that are not encrypted to the identity are skipped with a
+# warning. Everything is written and checked before anything is renamed
+# into place. Copies of the old identity elsewhere (snapshots, backups)
+# still open the files as they were before, with the old passphrase.
+cmd_rekey() {
+	need age age-keygen cmp
+	check_writable age age-keygen
+	[ -f "$VIAGE_IDENTITY" ] || die "$VIAGE_IDENTITY not found (run $prog init)"
+	case $VIAGE_FILE in
+	"$VIAGE_DIR"/*) ;;
+	*)
+		if [ -f "$VIAGE_FILE" ]; then
+			die "$VIAGE_FILE is outside $VIAGE_DIR; rekey works on $VIAGE_DIR only"
+		fi
+		;;
+	esac
+	for f in "$VIAGE_IDENTITY.old" "$VIAGE_IDENTITY.rekey" "$VIAGE_DIR"/*.rekey; do
+		[ -e "$f" ] && die "$f exists; a previous rekey did not finish"
+	done
+	for f in "$VIAGE_DIR"/*.new.*; do
+		[ -e "$f" ] && die "$f holds an unsaved edit; recover or remove it first"
+	done
+	set --
+	for f in "$VIAGE_DIR"/*.age "$VIAGE_DIR"/*.age.bak; do
+		[ -f "$f" ] && ! [ "$f" -ef "$VIAGE_IDENTITY" ] || continue
+		case $(age_kind "$f") in
+		x25519 | armored) set -- "$@" "$f" ;;
+		scrypt) warn "skipping $f: it has its own passphrase ($prog add brings it in)" ;;
+		none) warn "skipping $f: it is not age-encrypted" ;;
+		*) warn "skipping $f: it is encrypted to another kind of key" ;;
+		esac
+	done
+	[ $# -gt 0 ] || die "no vault files in $VIAGE_DIR"
+	mktmp
+
+	unlock
+	# Keep only the files the identity opens, numbered in order.
+	n=0
+	i=$#
+	while [ "$i" -gt 0 ]; do
+		f=$1
+		shift
+		i=$((i - 1))
+		cp "$f" "$tmp/try.age"
+		if age -d -i "$tmp/identity" -o "$tmp/try" "$tmp/try.age" 2>/dev/null; then
+			n=$((n + 1))
+			mv "$tmp/try.age" "$tmp/$n.age"
+			mv "$tmp/try" "$tmp/$n"
+			set -- "$@" "$f"
+		else
+			warn "skipping $f: it does not decrypt with this identity"
+			rm -f "$tmp/try" "$tmp/try.age"
+		fi
+	done
+	[ $# -gt 0 ] || die "nothing in $VIAGE_DIR decrypts with this identity; nothing changed"
+
+	age-keygen -o "$tmp/new" 2>/dev/null
+	recipient=$(age-keygen -y "$tmp/new")
+	printf 'Choose the new vault passphrase.\n' >&2
+	age -p -a -o "$tmp/new.age" "$tmp/new" ||
+		die "identity not created; nothing changed"
+
+	# Encrypt and verify in RAM, then copy beside the originals and
+	# compare byte for byte, in case of a short write (NFS).
+	rekeying=writing
+	cp "$tmp/new.age" "$VIAGE_IDENTITY.rekey"
+	cmp -s "$tmp/new.age" "$VIAGE_IDENTITY.rekey" ||
+		die "writing $VIAGE_IDENTITY.rekey failed; nothing changed"
+	n=0
+	for f; do
+		n=$((n + 1))
+		age -r "$recipient" -o "$tmp/$n.new" "$tmp/$n"
+		age -d -i "$tmp/new" "$tmp/$n.new" | cmp -s - "$tmp/$n" ||
+			die "verification failed for $f; nothing changed"
+		cp "$tmp/$n.new" "$f.rekey"
+		cmp -s "$tmp/$n.new" "$f.rekey" ||
+			die "writing $f.rekey failed; nothing changed"
+		cmp -s "$tmp/$n.age" "$f" ||
+			die "$f changed during the rekey; nothing changed"
+	done
+
+	# The identity goes first and the old one is kept until every file
+	# is in place, so an interruption leaves something recoverable.
+	trap '' HUP INT TERM
+	rekeying=committing
+	mv -f "$VIAGE_IDENTITY" "$VIAGE_IDENTITY.old"
+	mv -f "$VIAGE_IDENTITY.rekey" "$VIAGE_IDENTITY"
+	for f; do
+		mv -f "$f.rekey" "$f"
+	done
+	rm -f "$VIAGE_IDENTITY.old"
+	rekeying=
+
+	for f; do
+		warn "rekeyed $f"
+	done
+	warn "new identity in $VIAGE_IDENTITY. Update every copy of the passphrase"
+	warn "and of ${VIAGE_IDENTITY##*/} kept elsewhere. Older copies of the identity,"
+	warn "in snapshots and backups, still open these files as they were before"
+	warn "now; rotate the secrets themselves if the old passphrase may be known."
+}
+
 case ${1:-} in
 -h | --help) usage ;;
 -V | --version) printf '%s %s\n' "$prog" "$VERSION" ;;
@@ -216,10 +630,27 @@ init)
 	[ $# -eq 1 ] || die "init takes no arguments"
 	cmd_init
 	;;
+cat)
+	[ $# -le 2 ] || { usage >&2; exit 2; }
+	[ $# -eq 2 ] && VIAGE_FILE=$(resolve "$2")
+	cmd_cat
+	;;
+add)
+	shift
+	cmd_add "$@"
+	;;
+list | ls)
+	[ $# -eq 1 ] || die "list takes no arguments"
+	cmd_list
+	;;
+rekey)
+	[ $# -eq 1 ] || die "rekey takes no arguments"
+	cmd_rekey
+	;;
 -*) usage >&2; exit 2 ;;
 *)
 	[ $# -le 1 ] || { usage >&2; exit 2; }
-	[ $# -eq 1 ] && VIAGE_FILE=$1
+	[ $# -eq 1 ] && VIAGE_FILE=$(resolve "$1")
 	cmd_edit
 	;;
 esac

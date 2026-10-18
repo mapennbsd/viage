@@ -14,12 +14,20 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LINUX = sys.platform.startswith("linux")
+# A RAM-backed directory for the tests' own scratch space.
+RAMROOT = os.environ.get("VIAGE_TMPDIR") or os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 VIAGE = os.path.join(ROOT, "viage")
 PASS = "correct horse battery staple"
+NEWPASS = "tr0ub4dor and 3"
 
 
 def run(args, env, passphrase=PASS):
-    """Run a command on a pty, answering passphrase prompts. Returns (status, output)."""
+    """Run a command on a pty, answering passphrase prompts. Returns (status, output).
+
+    passphrase may be a list, answered in order; the last one repeats.
+    """
+    answers = [passphrase] if isinstance(passphrase, str) else list(passphrase)
     pid, fd = pty.fork()
     if pid == 0:
         os.execvpe(args[0], args, env)
@@ -34,7 +42,8 @@ def run(args, env, passphrase=PASS):
         out += data
         pending += data
         if b"passphrase" in pending.lower() and pending.rstrip().endswith(b":"):
-            os.write(fd, passphrase.encode() + b"\n")
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            os.write(fd, answer.encode() + b"\n")
             pending = b""
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
@@ -48,13 +57,16 @@ def editor(env, body):
     env["VIAGE_EDITOR"] = path
 
 
-def plaintext(env):
-    status, out = run(["age", "-d", "-o", env["HOME"] + "/id", env["VIAGE_IDENTITY"]], env)
+def plaintext(env, passphrase=PASS, path=None):
+    status, out = run(["age", "-d", "-o", env["HOME"] + "/id", env["VIAGE_IDENTITY"]], env, passphrase)
     assert status == 0, out
-    return subprocess.run(
-        ["age", "-d", "-i", env["HOME"] + "/id", env["VIAGE_FILE"]],
-        check=True, capture_output=True, text=True,
-    ).stdout
+    try:
+        return subprocess.run(
+            ["age", "-d", "-i", env["HOME"] + "/id", path or env["VIAGE_FILE"]],
+            check=True, capture_output=True, text=True,
+        ).stdout
+    finally:
+        os.remove(env["HOME"] + "/id")
 
 
 def ram_leftovers(env):
@@ -64,11 +76,13 @@ def ram_leftovers(env):
 
 def setup():
     home = tempfile.mkdtemp(prefix="viage-test.")
-    ram = tempfile.mkdtemp(prefix="viage-test.", dir=os.environ["XDG_RUNTIME_DIR"])
+    ram = tempfile.mkdtemp(prefix="viage-test.", dir=RAMROOT)
     env = dict(os.environ, HOME=home, VIAGE_DIR=home + "/vault", VIAGE_TMPDIR=ram)
     env["VIAGE_IDENTITY"] = env["VIAGE_DIR"] + "/identity.age"
     env["VIAGE_FILE"] = env["VIAGE_DIR"] + "/secrets.age"
     status, out = run([VIAGE, "init"], env)
+    if status != 0:
+        teardown(env)
     assert status == 0, out
     return env
 
@@ -181,6 +195,355 @@ def test_no_warning_for_system_editor(env):
     assert status == 0, out
     assert "/usr/bin/true is writable" not in out, out
     assert "/usr/bin is writable" not in out, out
+
+
+def add_secret(env, line="token=abc123"):
+    editor(env, f'echo "{line}" >> "$1"')
+    status, out = run([VIAGE], env)
+    assert status == 0, out
+
+
+def test_cat_terminal(env):
+    add_secret(env)
+    status, out = run([VIAGE, "cat"], env)
+    assert status == 0, out
+    assert "token=abc123" in out, out
+    assert "printing plaintext to the terminal" in out, out
+    # The warning comes before the prompt, so there is time to back out.
+    assert out.index("warning: printing") < out.lower().index("passphrase"), out
+
+
+def test_cat_to_pipe(env):
+    add_secret(env)
+    dest = env["HOME"] + "/out"
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat | cat > "{dest}"'], env)
+    assert status == 0, out
+    assert "goes to a pipe" in out and "wl-copy --sensitive" in out, out
+    assert "token=abc123" not in out, out
+    assert read(dest) == b"token=abc123\n"
+
+
+def test_cat_to_disk_file(env):
+    if not LINUX:
+        return
+    add_secret(env)
+    disk = tempfile.mkdtemp(prefix=".viage-test.", dir=ROOT)
+    try:
+        dest = disk + "/out"
+        status, out = run(["sh", "-c", f'"{VIAGE}" cat > "{dest}"'], env)
+        assert status == 0, out
+        assert f"writing plaintext to {dest} on persistent storage" in out, out
+        assert read(dest) == b"token=abc123\n"
+    finally:
+        shutil.rmtree(disk)
+
+
+def test_cat_to_ram_file(env):
+    if not LINUX:
+        return
+    add_secret(env)
+    dest = env["VIAGE_TMPDIR"] + "/out"
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat > "{dest}"'], env)
+    assert status == 0, out
+    assert "(RAM-backed)" in out, out
+    os.remove(dest)
+
+
+def test_cat_to_dev_null(env):
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat > /dev/null'], env)
+    assert status == 0, out
+    assert "plaintext" not in out, out
+
+
+def test_cat_wrong_passphrase(env):
+    add_secret(env)
+    status, out = run([VIAGE, "cat"], env, passphrase="wrong")
+    assert status != 0, out
+    assert "token=abc123" not in out, out
+
+
+def test_rekey(env):
+    add_secret(env)
+    add_secret(env, "second=xyz")  # leaves a .bak holding the first version
+    other = env["VIAGE_DIR"] + "/other.age"
+    shutil.copy(env["VIAGE_FILE"], other)
+    old_identity = read(env["VIAGE_IDENTITY"])
+    shutil.copy(env["VIAGE_IDENTITY"], env["HOME"] + "/old-identity.age")
+
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0, out
+    assert "rekeyed" in out and "rotate the secrets" in out, out
+    assert read(env["VIAGE_IDENTITY"]) != old_identity
+    assert read(env["VIAGE_IDENTITY"]).startswith(b"-----BEGIN AGE ENCRYPTED FILE-----\n")
+    assert plaintext(env, NEWPASS) == "token=abc123\nsecond=xyz\n"
+    assert plaintext(env, NEWPASS, other) == "token=abc123\nsecond=xyz\n"
+    assert plaintext(env, NEWPASS, env["VIAGE_FILE"] + ".bak") == "token=abc123\n"
+    status, out = run([VIAGE, "cat"], env, PASS)
+    assert status != 0, out
+    # The old identity no longer opens the vault.
+    old = dict(env, VIAGE_IDENTITY=env["HOME"] + "/old-identity.age")
+    status, out = run([VIAGE, "cat"], old, PASS)
+    assert status != 0 and "cannot decrypt" in out, out
+    leftovers = [n for n in os.listdir(env["VIAGE_DIR"]) if n.endswith((".rekey", ".old"))]
+    assert not leftovers, leftovers
+
+
+def vault_state(env):
+    d = env["VIAGE_DIR"]
+    return {n: read(os.path.join(d, n)) for n in sorted(os.listdir(d))}
+
+
+def test_rekey_wrong_passphrase(env):
+    add_secret(env)
+    before = vault_state(env)
+    status, out = run([VIAGE, "rekey"], env, ["wrong", NEWPASS])
+    assert status != 0 and "cannot unlock" in out, out
+    assert vault_state(env) == before
+
+
+def foreign_key_file(env, path, content=b"other key\n"):
+    subprocess.run(["age-keygen", "-o", env["HOME"] + "/foreign"], check=True, capture_output=True)
+    subprocess.run(
+        ["age", "-e", "-i", env["HOME"] + "/foreign", "-o", path],
+        input=content, check=True,
+    )
+
+
+def own_passphrase_file(env, path, content="luks header\n", passphrase="their pass"):
+    src = env["VIAGE_TMPDIR"] + "/src"
+    with open(src, "w") as f:
+        f.write(content)
+    status, out = run(["age", "-p", "-o", path, src], env, passphrase)
+    assert status == 0, out
+    os.remove(src)
+
+
+def test_rekey_skips_foreign_files(env):
+    add_secret(env)
+    foreign_key_file(env, env["VIAGE_DIR"] + "/zz.age")
+    own_passphrase_file(env, env["VIAGE_DIR"] + "/hdr.age")
+    with open(env["VIAGE_DIR"] + "/plain.age", "w") as f:
+        f.write("not encrypted\n")
+    untouched = {n: read(env["VIAGE_DIR"] + "/" + n) for n in ("zz.age", "hdr.age", "plain.age")}
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0, out
+    assert "skipping" in out and "zz.age: it does not decrypt" in out, out
+    assert "hdr.age: it has its own passphrase" in out, out
+    assert "plain.age: it is not age-encrypted" in out, out
+    # Only the vault passphrase and the new one were asked for.
+    assert out.lower().count("passphrase:") + out.lower().count("passphrase for") <= 4, out
+    assert plaintext(env, NEWPASS) == "token=abc123\n"
+    for n, data in untouched.items():
+        assert read(env["VIAGE_DIR"] + "/" + n) == data, n
+
+
+def test_rekey_nothing_to_do(env):
+    os.remove(env["VIAGE_FILE"])
+    own_passphrase_file(env, env["VIAGE_DIR"] + "/hdr.age")
+    before = vault_state(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS])
+    assert status != 0 and "no vault files" in out, out
+    assert vault_state(env) == before
+
+
+def test_name_resolves_in_vault(env):
+    shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/other.age")
+    editor(env, 'echo other >> "$1"')
+    status, out = run([VIAGE, "other"], env)
+    assert status == 0 and "saved " + env["VIAGE_DIR"] + "/other.age" in out, out
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat other.age > /dev/null'], env)
+    assert status == 0, out
+    status, out = run([VIAGE, "missing"], env)
+    assert status != 0 and env["VIAGE_DIR"] + "/missing.age not found" in out, out
+
+
+def mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+def test_add_from_ram(env):
+    src = env["VIAGE_TMPDIR"] + "/api-token"
+    with open(src, "w") as f:
+        f.write("tok=1\n")
+    status, out = run([VIAGE, "add", src], env)
+    assert status == 0, out
+    dest = env["VIAGE_DIR"] + "/api-token.age"
+    assert "added " + dest + "; removed " + src in out, out
+    assert "persistent storage" not in out, out
+    assert not os.path.exists(src)
+    assert plaintext(env, path=dest) == "tok=1\n"
+    assert mode(dest) == 0o600
+
+
+def test_add_from_disk_warns(env):
+    disk = tempfile.mkdtemp(prefix=".viage-test.", dir=ROOT)
+    try:
+        src = disk + "/notes.txt"
+        with open(src, "w") as f:
+            f.write("note\n")
+        status, out = run([VIAGE, "add", src], env)
+        assert status == 0, out
+        assert "was plaintext on persistent storage" in out, out
+        assert not os.path.exists(src)
+        assert plaintext(env, path=env["VIAGE_DIR"] + "/notes.txt.age") == "note\n"
+    finally:
+        shutil.rmtree(disk)
+
+
+def test_add_keep(env):
+    src = env["VIAGE_TMPDIR"] + "/k"
+    with open(src, "w") as f:
+        f.write("k\n")
+    status, out = run([VIAGE, "add", "-k", src], env)
+    assert status == 0 and "kept " + src in out, out
+    assert os.path.exists(src)
+    os.remove(src)
+
+
+def test_add_refuses_existing(env):
+    src = env["VIAGE_TMPDIR"] + "/secrets"
+    with open(src, "w") as f:
+        f.write("x\n")
+    before = vault_state(env)
+    status, out = run([VIAGE, "add", src], env)
+    assert status != 0 and "secrets.age exists" in out, out
+    assert "passphrase" not in out.lower(), out
+    assert os.path.exists(src) and vault_state(env) == before
+    os.remove(src)
+
+
+def test_add_refuses_duplicate_names(env):
+    a = env["VIAGE_TMPDIR"] + "/a"
+    os.mkdir(a)
+    for p in (a + "/n", env["VIAGE_TMPDIR"] + "/n"):
+        with open(p, "w") as f:
+            f.write("x\n")
+    status, out = run([VIAGE, "add", a + "/n", env["VIAGE_TMPDIR"] + "/n"], env)
+    assert status != 0 and "two files would be added" in out, out
+    assert not os.path.exists(env["VIAGE_DIR"] + "/n.age")
+    shutil.rmtree(a)
+    os.remove(env["VIAGE_TMPDIR"] + "/n")
+
+
+def test_add_own_passphrase_in_place(env):
+    hdr = env["VIAGE_DIR"] + "/hdr.age"
+    own_passphrase_file(env, hdr)
+    os.chmod(hdr, 0o644)
+    status, out = run([VIAGE, "add", hdr], env, [PASS, "their pass"])
+    assert status == 0 and "re-encrypted " + hdr in out, out
+    assert plaintext(env, path=hdr) == "luks header\n"
+    assert mode(hdr) == 0o600
+    # Now it is under the vault identity, rekey covers it.
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0 and "rekeyed " + hdr in out, out
+    assert plaintext(env, NEWPASS, hdr) == "luks header\n"
+
+
+def test_add_wrong_own_passphrase(env):
+    hdr = env["VIAGE_DIR"] + "/hdr.age"
+    own_passphrase_file(env, hdr)
+    before = vault_state(env)
+    status, out = run([VIAGE, "add", hdr], env, [PASS, "wrong"])
+    assert status != 0 and "nothing added" in out, out
+    assert vault_state(env) == before
+
+
+def test_add_foreign_key_refused(env):
+    src = env["VIAGE_TMPDIR"] + "/f.age"
+    foreign_key_file(env, src)
+    ok = env["VIAGE_TMPDIR"] + "/ok"
+    with open(ok, "w") as f:
+        f.write("fine\n")
+    before = vault_state(env)
+    # The good file comes first; nothing is written when a later one fails.
+    status, out = run([VIAGE, "add", ok, src], env)
+    assert status != 0 and "another key; nothing added" in out, out
+    assert vault_state(env) == before
+    assert os.path.exists(ok) and os.path.exists(src)
+    os.remove(ok)
+    os.remove(src)
+
+
+def test_add_already_in_vault(env):
+    before = vault_state(env)
+    status, out = run([VIAGE, "add", env["VIAGE_FILE"]], env)
+    assert status == 0 and "already in the vault" in out, out
+    assert vault_state(env) == before
+
+
+def test_binary_roundtrip_and_edit_refuses(env):
+    data = bytes(range(256)) * 64
+    src = env["VIAGE_TMPDIR"] + "/blob"
+    with open(src, "wb") as f:
+        f.write(data)
+    status, out = run([VIAGE, "add", src], env)
+    assert status == 0, out
+    dest = env["VIAGE_DIR"] + "/blob.age"
+    out_path = env["VIAGE_TMPDIR"] + "/blob.out"
+    status, out = run(["sh", "-c", f'"{VIAGE}" cat blob > "{out_path}"'], env)
+    assert status == 0, out
+    assert read(out_path) == data
+    os.remove(out_path)
+    editor(env, 'echo x >> "$1"')
+    before = read(dest)
+    status, out = run([VIAGE, "blob"], env)
+    assert status != 0 and "binary data" in out, out
+    assert read(dest) == before
+
+
+def test_list(env):
+    add_secret(env)  # leaves secrets.age.bak
+    shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/other.age")
+    own_passphrase_file(env, env["VIAGE_DIR"] + "/hdr.age")
+    os.chmod(env["VIAGE_DIR"] + "/hdr.age", 0o644)
+    with open(env["VIAGE_DIR"] + "/dropped.txt", "w") as f:
+        f.write("oops\n")
+    os.mkdir(env["VIAGE_DIR"] + "/subdir", 0o700)
+    for n in ("a", "b"):
+        open(env["VIAGE_DIR"] + "/subdir/" + n, "w").close()
+    os.chmod(env["VIAGE_DIR"], 0o755)
+    status, out = run([VIAGE, "list"], env)
+    assert status == 0, out
+    assert "wc:" not in out and "Is a directory" not in out, out
+    assert "passphrase:" not in out.lower(), out
+    lines = {l.split()[0]: l for l in out.splitlines() if l.strip() and not l.startswith("viage:")}
+    assert "identity" in lines["identity.age"], out
+    assert lines["secrets.age"].endswith("  default vault"), out
+    assert lines["secrets.age.bak"].endswith("  previous version of secrets.age"), out
+    assert lines["other.age"].endswith("  "), out
+    assert "own passphrase" in lines["hdr.age"] and "open to others (-rw-r--r--" in lines["hdr.age"], out
+    assert "NOT ENCRYPTED" in lines["dropped.txt"], out
+    assert lines["subdir"].split()[1] == "-" and "not a regular file" in lines["subdir"], out
+    # One line per entry, nothing from inside the subdirectory.
+    entries = [l for l in out.splitlines() if l.strip() and not l.startswith("viage:")]
+    assert len(entries) == len(os.listdir(env["VIAGE_DIR"])), out
+    assert "is open to others" in out and "chmod 700" in out, out
+
+
+def test_rekey_refuses_unsaved_edit(env):
+    with open(env["VIAGE_FILE"] + ".new.123", "wb") as f:
+        f.write(b"x")
+    before = vault_state(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS])
+    assert status != 0 and "unsaved edit" in out, out
+    assert vault_state(env) == before
+
+
+def test_rekey_refuses_unfinished_rekey(env):
+    with open(env["VIAGE_FILE"] + ".rekey", "wb") as f:
+        f.write(b"x")
+    before = vault_state(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS])
+    assert status != 0 and "did not finish" in out, out
+    assert vault_state(env) == before
+
+
+def test_rekey_abandoned_at_new_passphrase(env):
+    # A confirmation that does not match makes age -p fail.
+    before = vault_state(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, "different"])
+    assert status != 0 and "nothing changed" in out, out
+    assert vault_state(env) == before
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

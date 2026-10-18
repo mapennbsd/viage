@@ -13,6 +13,8 @@ viage: saved /home/me/.local/share/viage/secrets.age
 One passphrase prompt per edit. The plaintext exists only in a RAM-backed
 directory for as long as the editor is open, so the copies on disk, on a
 file server, in snapshots and in cloud backups are always ciphertext.
+The exceptions are the ones you choose: `viage cat` prints the plaintext
+wherever you send it, and anything you copy goes to the clipboard.
 
 viage is a single POSIX shell script with age doing all the cryptography.
 It is short enough to read in a few minutes, which you should do before
@@ -64,8 +66,9 @@ be a different user or a sandbox:
   warning, so treat it as a check on how things are installed, not as
   tamper detection.
 - Type the passphrase rather than pasting it. On most desktops any process
-  running as you can read the clipboard. The same goes for secrets you
-  copy out of the vault.
+  running as you can read the clipboard, and clipboard managers write
+  their history to disk. The same goes for secrets you copy out of the
+  vault: see [Copying a secret](#copying-a-secret).
 - Never paste a secret into an agent session. It stays in the transcript.
 
 ## viage and sops
@@ -91,7 +94,10 @@ your sops files use can itself live in the viage vault.
 
 ## Install
 
-Requires `age` and `age-keygen` (v1.1 or later) and a POSIX shell.
+Requires `age` and `age-keygen` (v1.1 or later) and a POSIX shell. The
+rest is in any Linux or BSD base system: `cmp`, `mktemp`, `dd`, `tr`,
+`sed`, `awk`, `df`. `base64` is optional (`list` uses it to read armored
+files), and so is `wl-copy` (see [Copying a secret](#copying-a-secret)).
 
 ```
 sudo install -o root -g root -m 755 viage /usr/local/bin/
@@ -116,6 +122,12 @@ Both are safe to keep on shared or backed-up storage. To recover the vault
 you need the passphrase and a copy of `identity.age`; keep both somewhere
 other than where the vault lives.
 
+The vault directory defaults to `~/.local/share/viage`, created mode 700,
+and every file viage writes is mode 600. A local directory under your
+home is the better place for it: snapshots and backups of your home
+still get the ciphertext, and nothing else that shares a file server can
+see it.
+
 An identity created by an earlier viage is binary. age reads either form;
 to convert one to text without re-encrypting it:
 
@@ -129,18 +141,147 @@ to convert one to text without re-encrypting it:
 
 ```
 viage              # edit $VIAGE_FILE
-viage other.age    # edit another file encrypted to the same identity
+viage notes        # edit $VIAGE_DIR/notes.age
+viage cat          # print $VIAGE_FILE to stdout
+viage cat notes
+viage add file...  # encrypt files into the vault and remove the originals
+viage list         # what is in the vault, without the passphrase
+viage rekey        # new identity and passphrase for everything in $VIAGE_DIR
 ```
 
+A name without a slash is a file in `$VIAGE_DIR`, with `.age` added if
+it is missing. A name with a slash (`./notes.age`, `/mnt/x.age`) is a path.
+
 Quit the editor with an error (`:cq` in vim) to discard your changes.
-If the content did not change, the file is not rewritten.
+If the content did not change, the file is not rewritten. A file that
+holds binary data, such as a LUKS header, is not opened in the editor;
+use `viage cat` to get it out.
+
+### What belongs in the vault
+
+Every file in `$VIAGE_DIR` should be encrypted to the vault identity, so
+that one passphrase opens all of it and `rekey` covers all of it. Keep
+files under other keys somewhere else. For a separate compartment, with
+its own passphrase, make a second vault: another directory with its own
+`identity.age`, used with `VIAGE_DIR=... viage`.
+
+### Adding files
+
+`viage add` encrypts each file to the identity, writes it into
+`$VIAGE_DIR` as `name.age`, reads it back to verify it, and then removes
+the original (`-k` keeps it). Every file is checked before the first is
+written, and an existing vault file is never overwritten.
+
+A file that is already age-encrypted is decrypted first and re-encrypted
+to the identity. If it has a passphrase of its own, age asks for it. That
+is how a file made with `age -p` comes under the vault; if it is already
+in `$VIAGE_DIR`, it is re-encrypted in place. A file encrypted to another
+key is refused.
+
+Removing the original is an ordinary delete. On a copy-on-write
+filesystem (btrfs, ZFS) nothing better is possible, and snapshots and
+backups that already copied the file keep it. viage says so when the
+original was plaintext on persistent storage. The clean way is never to
+let the plaintext reach the disk: create it in a RAM-backed directory and
+add it from there.
+
+```
+cryptsetup luksHeaderBackup /dev/nvme0n1p2 --header-backup-file /run/user/1000/root.luks-header
+viage add /run/user/1000/root.luks-header
+```
+
+### Listing the vault
+
+`viage list` shows each file with its size and date, labels the identity,
+the default vault (`$VIAGE_FILE`) and the previous versions that edit
+keeps (`*.age.bak`), and flags anything
+that does not belong: a file that is not encrypted at all, a file with a
+passphrase of its own, a file or directory open to other users, and
+leftovers from an interrupted edit, add or rekey. It reads only the age
+headers and asks for no passphrase. A header shows whether a file has its
+own passphrase or is encrypted to a key, but not which key; only `cat` or
+`rekey` can confirm a file opens with the identity.
+
+### Copying a secret
+
+vim and neovim run without your config, so yank (`y`) stays in the
+editor's own registers and the mouse makes a visual selection. To copy
+to the desktop clipboard, select the text and press `Y`. viage maps it to
+`wl-copy --sensitive`, which drops trailing newlines and asks clipboard
+managers not to record the copy. Omarchy's clipboard history honors the
+request; check that yours does.
+
+Avoid copying any other way: `"+y`, or a terminal selection with Shift
+and the mouse. Those copies are not marked sensitive, so a clipboard
+manager can write them to its history file on disk, where they end up
+in snapshots and backups. The same is true of a secret you copy from
+elsewhere to paste into the vault. `Y` needs Wayland and a wl-copy that has
+`--sensitive`; without wl-copy, nothing is mapped.
+
+### Printing to stdout
+
+`viage cat` decrypts straight to stdout, for `grep` or a one-off pipe:
+
+```
+viage cat | grep -i telegram
+viage cat | sed -n 's/^nut=//p' | wl-copy --sensitive
+```
+
+It is the one command that puts plaintext outside viage's control, so it
+says where the output is going before it asks for the passphrase, leaving
+time to press ^C:
+
+- **A terminal:** the text stays in the scrollback, a multiplexer's log,
+  and anything that reads the terminal. Never run it inside an agent's
+  session, for example with `!` in Claude Code; the output goes into the
+  transcript and to the model provider.
+- **A file:** a file on persistent storage outlives the command, in
+  snapshots and backups too. A file on tmpfs is reported as RAM-backed,
+  but it stays until you remove it.
+- **A pipe:** the reader decides where it ends up. To copy, use
+  `wl-copy --sensitive`, not plain `wl-copy`.
+
+An agent cannot run `viage cat` by itself, because age reads the
+passphrase from the terminal.
+
+### Changing the passphrase
+
+`viage rekey` makes a new identity under a new passphrase and re-encrypts
+every `*.age` and `*.age.bak` file in `$VIAGE_DIR` to it. The old identity
+is replaced, not re-wrapped, because changing only the passphrase would
+not revoke the old one. Every copy of the old `identity.age` (snapshots,
+backups, a file server) would still open with the old passphrase, and it
+would still decrypt the current vault.
+
+After a rekey, copies of the old identity open only copies of the vault
+made before the rekey. Those still hold your secrets as they were. If the
+old passphrase may be known, rotate the secrets themselves.
+
+Each file is decrypted, re-encrypted, verified in RAM, written beside the
+original as `*.rekey` and compared byte for byte before anything is
+renamed. If anything fails, nothing changes.
+
+A file in `$VIAGE_DIR` that the identity does not open is skipped with a
+warning and left as it is: one with its own passphrase (bring it in with
+`viage add`), one encrypted to another key, or one that is not encrypted.
+Skipping is safe, because a file the old identity cannot open is not
+exposed by it either. Rekey refuses to start when:
+
+- an unsaved edit (`*.new.*`) is waiting, or
+- a previous rekey did not finish.
+
+The identity is renamed into place first and the old one is kept as
+`identity.age.old` until every file is in place, so an interruption leaves
+a state you can recover by hand. Files outside `$VIAGE_DIR` are not found;
+keep the vault files together. Afterwards, update every copy of the
+passphrase and of `identity.age` you keep elsewhere.
 
 | Variable | Default |
 |---|---|
 | `VIAGE_DIR` | `$XDG_DATA_HOME/viage` |
 | `VIAGE_IDENTITY` | `$VIAGE_DIR/identity.age` |
 | `VIAGE_FILE` | `$VIAGE_DIR/secrets.age` |
-| `VIAGE_TMPDIR` | first tmpfs of `$XDG_RUNTIME_DIR`, `/dev/shm` |
+| `VIAGE_TMPDIR` | the first RAM-backed of `$XDG_RUNTIME_DIR`, `/dev/shm`, `/tmp` |
 | `VIAGE_EDITOR` | `$VISUAL`, `$EDITOR`, `vi` |
 
 ## How it works
@@ -171,7 +312,8 @@ tmpfs, readable by your user, for as long as the editor is open.
 Points to be aware of:
 
 - **Swap.** tmpfs pages can be swapped out. Use encrypted swap, or zram
-  only.
+  only. OpenBSD encrypts swap by default; on FreeBSD use an `.eli` swap
+  device.
 - **The editor.** vim and neovim are started with `--clean -n -i NONE` and
   undo, backup and write-backup files turned off: no swap file, no history
   file, and no user config or plugins. Other editors are run as they are,
@@ -179,13 +321,23 @@ Points to be aware of:
   they write and what plugins they load. The editor must not return before
   you are done (`code --wait`, not `code`).
 - **Your terminal and clipboard.** Anything you copy out of the editor is
-  outside viage's control: clipboard managers, terminal scrollback.
+  outside viage's control. `Y` asks clipboard managers not to record it,
+  and `viage cat` warns where its output is going. Terminal scrollback
+  and clipboard managers that ignore the hint are up to you.
 - **Rollback.** Someone who can write to the vault directory can replace
   `secrets.age` with an older copy. age authenticates the content, so they
   cannot forge or alter it.
-- **Platforms.** Tested on Linux, where viage checks that the plaintext
-  directory is tmpfs or ramfs. Elsewhere it insists on `VIAGE_TMPDIR`, and
-  you are responsible for it being RAM-backed.
+- **Platforms.** viage checks that the plaintext directory is RAM-backed:
+  tmpfs or ramfs on Linux, tmpfs on FreeBSD, mfs on OpenBSD (a tmpfs or
+  mfs `/tmp` is found by itself). On macOS a RAM disk looks like any other
+  volume, so `VIAGE_TMPDIR` must be set and you vouch for it. Tested on
+  Linux; the BSD checks are tested by simulation only so far.
+- **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
+  Its working file goes to the private directory, but if it is killed or
+  the terminal hangs up, it saves a recovery copy, in plaintext, to
+  `/var/tmp/vi.recover`. Use `VIAGE_EDITOR=vim` or `nvim` there.
+- **`viage cat` on BSD.** It cannot see where its
+  output goes (there is no `/proc`), so it gives the general warning.
 
 ## Tests
 
