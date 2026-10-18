@@ -17,7 +17,7 @@ The exceptions are the ones you choose: `viage cat` prints the plaintext
 wherever you send it, and anything you copy goes to the clipboard.
 
 viage is a single POSIX shell script with age doing all the cryptography.
-It is short enough to read in a few minutes, which you should do before
+It is short enough to read in one sitting, which you should do before
 trusting it with secrets.
 
 ## Why: secrets and AI agents
@@ -347,3 +347,8 @@ python3 tests/run.py
 
 The tests drive age's passphrase prompts through a pseudo-terminal, so they
 need nothing beyond Python and age.
+
+## License
+
+ISC, the license OpenBSD uses; see [LICENSE](LICENSE). To report a
+security problem, see [SECURITY.md](SECURITY.md).
