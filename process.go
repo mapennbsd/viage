@@ -1,5 +1,9 @@
 package main
 
+// Messages and exiting; what viage puts right on the way out (the
+// terminal, staged files, an unfinished rekey, the plaintext directory,
+// the vault lock); and signals, passed on to the editor while it runs.
+
 import (
 	"fmt"
 	"os"
