@@ -1,5 +1,8 @@
 package main
 
+// viage add: encrypting files into the vault, then removing the
+// originals unless -k is given.
+
 import (
 	"bytes"
 	"fmt"
