@@ -537,7 +537,11 @@ def test_list(env):
     assert "wc:" not in out and "Is a directory" not in out, out
     assert "passphrase:" not in out.lower(), out
     lines = {l.split()[0]: l for l in out.splitlines() if l.strip() and not l.startswith("viage:")}
-    assert "identity" in lines["identity.age"], out
+    assert "viage's key to this vault; keep a backup" in lines["identity.age"], out
+    # viage's own files come last, after a blank line; yours come first.
+    yours, _, viages = out.replace("\r\n", "\n").rstrip("\n").rpartition("\n\n")
+    assert [l.split()[0] for l in viages.splitlines()] == ["identity.age", "index.age"], out
+    assert "identity.age" not in yours and "index.age" not in yours and "secrets.age" in yours, out
     assert lines["secrets.age"].endswith("  default vault"), out
     assert lines["secrets.age.bak"].endswith("  previous version of secrets.age"), out
     assert lines["other.age"].endswith("  "), out
@@ -654,7 +658,7 @@ def test_lock_refuses_writers(env):
     status, out = run(["sh", "-c", f'"{VIAGE}" cat > /dev/null'], env)
     assert status == 0, out
     status, out = run([VIAGE, "list"], env)
-    assert status == 0 and f"lock held by process {os.getpid()}" in out, out
+    assert status == 0 and f"viage's lock, held by process {os.getpid()}" in out, out
     release_lock(env)
     os.remove(src)
 
@@ -759,7 +763,7 @@ def test_index_created_by_init(env):
     assert os.path.exists(env["VIAGE_DIR"] + "/index.age")
     out, rows = listing(env)
     assert "passphrase" not in out.lower(), out
-    assert "index (descriptions" in rows["index.age"], out
+    assert "viage's descriptions and checksums (viage list -v)" in rows["index.age"], out
     out, rows = listing(env, "-v")
     assert rows["secrets.age"].endswith("  default vault"), out
     assert "CHANGED" not in out and "MISSING" not in out, out

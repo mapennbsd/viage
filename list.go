@@ -36,11 +36,13 @@ func vaultEntries() []string {
 // A file left by a viage that was stopped while writing (see stage).
 var stagedName = regexp.MustCompile(`^\..*\.age(\.bak)?\.[A-Za-z0-9]{6}$`)
 
-// cmdList lists the vault directory. By default nothing is decrypted
-// and no passphrase is asked for; the age header tells a file with its
-// own passphrase from one encrypted to a key, but not which key. With
-// -v it unlocks the identity, shows the descriptions from the index and
-// checks every file against the checksum recorded there.
+// cmdList lists the vault directory: your files first, then, after a
+// blank line, the ones viage keeps for itself (the identity, the index,
+// the lock). By default nothing is decrypted and no passphrase is asked
+// for; the age header tells a file with its own passphrase from one
+// encrypted to a key, but not which key. With -v it unlocks the
+// identity, shows the descriptions from the index and checks every file
+// against the checksum recorded there.
 func cmdList(verbose bool) {
 	fi, err := os.Stat(vaultDir)
 	if err != nil || !fi.IsDir() {
@@ -64,6 +66,10 @@ func cmdList(verbose bool) {
 		}
 	}
 	seen := map[string]bool{}
+	var yours, viages []string
+	row := func(name, size, date, note string) string {
+		return fmt.Sprintf("%-32s %10s  %-12s  %s", name, size, date, note)
+	}
 	for _, name := range vaultEntries() {
 		path := filepath.Join(vaultDir, name)
 		fi, err := os.Lstat(path)
@@ -72,16 +78,19 @@ func cmdList(verbose bool) {
 		}
 		symlink := fi.Mode()&fs.ModeSymlink != 0
 		var note string
+		own := false
 		switch {
 		case name == ".lock" && fi.IsDir():
-			note = "lock held"
+			own = true
+			note = prog + "'s lock, held"
 			if pid := lockPID(path); pid > 0 {
 				note += " by process " + strconv.Itoa(pid)
 			}
 		case symlink || !fi.Mode().IsRegular():
 			note = "not a regular file"
 		case sameFile(path, identityPath):
-			note = "identity"
+			own = true
+			note = prog + "'s key to this vault; keep a backup"
 		case newName.MatchString(name):
 			note = "unsaved edit; recover or remove it"
 		case strings.HasSuffix(name, ".rekey"), strings.HasSuffix(name, ".old"):
@@ -89,9 +98,10 @@ func cmdList(verbose bool) {
 		case stagedName.MatchString(name):
 			note = "left by an interrupted " + prog + "; remove it"
 		case name == indexName:
-			note = "index"
+			own = true
+			note = prog + "'s descriptions and checksums"
 			if !verbose {
-				note += " (descriptions: " + prog + " list -v)"
+				note += " (" + prog + " list -v)"
 			}
 		default:
 			switch ageKind(path) {
@@ -127,23 +137,35 @@ func cmdList(verbose bool) {
 		if !symlink && fi.Mode().IsRegular() {
 			size = strconv.FormatInt(fi.Size(), 10)
 		}
-		fmt.Printf("%-32s %10s  %-12s  %s\n", name, size, lsDate(fi.ModTime()), note)
-	}
-	if ix == nil {
-		return
-	}
-	var missing []string
-	for name := range ix.Files {
-		if !seen[name] {
-			missing = append(missing, name)
+		if own {
+			viages = append(viages, row(name, size, lsDate(fi.ModTime()), note))
+		} else {
+			yours = append(yours, row(name, size, lsDate(fi.ModTime()), note))
 		}
 	}
-	sort.Strings(missing)
-	for _, name := range missing {
-		if exists(filepath.Join(vaultDir, name)) {
-			continue // there, but not encrypted to a key; flagged above
+	if ix != nil {
+		var missing []string
+		for name := range ix.Files {
+			if !seen[name] {
+				missing = append(missing, name)
+			}
 		}
-		fmt.Printf("%-32s %10s  %-12s  %s\n", name, "-", "-", "MISSING: in the index, not in the vault")
+		sort.Strings(missing)
+		for _, name := range missing {
+			if exists(filepath.Join(vaultDir, name)) {
+				continue // there, but not encrypted to a key; flagged above
+			}
+			yours = append(yours, row(name, "-", "-", "MISSING: in the index, not in the vault"))
+		}
+	}
+	for _, l := range yours {
+		fmt.Println(l)
+	}
+	if len(yours) > 0 && len(viages) > 0 {
+		fmt.Println()
+	}
+	for _, l := range viages {
+		fmt.Println(l)
 	}
 }
 

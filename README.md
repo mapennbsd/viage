@@ -282,13 +282,27 @@ viage add /run/user/1000/root.luks-header
 
 ### Listing the vault
 
-`viage list` shows each file with its size and date, labels the identity,
-the default vault (`$VIAGE_FILE`) and the previous versions that edit
-keeps (`*.age.bak`), and flags anything that does not belong: a file
-that is not encrypted at all, a file with a passphrase of its own, a
-file or directory open to other users, a held lock, and leftovers from
-an interrupted edit, add or rekey. It reads only the age headers and
-asks for no passphrase. A header shows whether a file has its
+`viage list` shows each file with its size and date: your files first,
+then, after a blank line, the ones viage keeps for itself (the identity,
+the index, and the lock while it is held). With `-v`:
+
+```
+$ viage list -v
+Enter passphrase:
+api-token.age          202  Oct 19 10:45  GitHub API token
+secrets.age            210  Oct 19 10:45  default vault
+secrets.age.bak        200  Oct 19 10:45  previous version of secrets.age
+
+identity.age           572  Oct 19 10:45  viage's key to this vault; keep a backup
+index.age              985  Oct 19 10:45  viage's descriptions and checksums
+```
+
+It labels the default vault (`$VIAGE_FILE`) and the previous versions
+that edit keeps (`*.age.bak`), and flags anything that does not belong:
+a file that is not encrypted at all, a file with a passphrase of its
+own, a file or directory open to other users, and leftovers from an
+interrupted edit, add or rekey. Without `-v` it reads only the age
+headers and asks for no passphrase. A header shows whether a file has its
 own passphrase or is encrypted to a key, but not which key; only `cat`,
 `list -v` or `rekey` can confirm a file opens with the identity.
 
