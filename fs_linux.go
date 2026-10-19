@@ -1,5 +1,7 @@
 package main
 
+// The filesystem type on Linux, from statfs's magic number.
+
 import "golang.org/x/sys/unix"
 
 func fsTypeOf(st *unix.Statfs_t) string {
