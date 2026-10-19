@@ -47,6 +47,7 @@ def run(args, env, passphrase=PASS):
             answer = answers.pop(0) if len(answers) > 1 else answers[0]
             os.write(fd, answer.encode() + b"\n")
             pending = b""
+    os.close(fd)
     _, status = os.waitpid(pid, 0)
     return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
 
@@ -1040,6 +1041,7 @@ def test_term_to_viage_alone_stops_the_editor(env):
             time.sleep(0.2)
             os.kill(int(open(home + "/viage.pid").read()), signal.SIGTERM)
             sent = True
+    os.close(fd)
     os.waitpid(pid, 0)
     out = out.decode(errors="replace")
     assert sent, out
