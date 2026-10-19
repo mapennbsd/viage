@@ -1,8 +1,9 @@
 package main
 
-// Unit tests for what the end-to-end suite (tests/run.py) cannot reach.
-// That suite drives the binary through a pseudo-terminal and is the
-// test of record for behavior; run both.
+// Unit tests for what the end-to-end suite (tests/run.py) cannot reach:
+// functions called directly, and states the binary cannot be driven into
+// from outside. That suite drives the binary through a pseudo-terminal
+// and is the test of record for behavior; run both.
 
 import (
 	"bytes"
