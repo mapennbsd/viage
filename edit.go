@@ -217,7 +217,7 @@ func cmdEdit() {
 		ix.record(name, ct)
 		ix.save(id)
 	}
-	warn("saved %s", vaultFile)
+	warn("saved %s", shown(vaultFile))
 }
 
 // runEditor runs the editor on file with swap, undo, backup and history

@@ -52,6 +52,15 @@ func inVault(path string) string {
 	return filepath.Base(path)
 }
 
+// shown is how messages name a file: by its name if it is in the vault
+// directory, by its path otherwise.
+func shown(path string) string {
+	if name := inVault(path); name != "" {
+		return name
+	}
+	return path
+}
+
 func indexMAC(files map[string]*fileMeta, id *age.X25519Identity) string {
 	key := sha256.Sum256([]byte("viage index v1\n" + id.String()))
 	b, _ := json.Marshal(files) // map keys are sorted, so this is stable

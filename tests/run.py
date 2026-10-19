@@ -114,9 +114,16 @@ def test_init_and_edit(env):
     editor(env, 'echo "token=abc123" >> "$1"')
     status, out = run([VIAGE], env)
     assert status == 0, out
-    assert "saved" in out, out
+    assert "Enter passphrase: " in out and "saved secrets.age" in out, out
     assert plaintext(env) == "token=abc123\n"
     assert os.path.exists(env["VIAGE_FILE"] + ".bak")
+
+
+def test_prompt_names_an_unusual_identity(env):
+    other = env["HOME"] + "/copy-of-identity.age"
+    shutil.copy(env["VIAGE_IDENTITY"], other)
+    status, out = run([VIAGE, "list", "-v"], dict(env, VIAGE_IDENTITY=other))
+    assert status == 0 and "Enter passphrase for " + other + ": " in out, out
 
 
 def test_init_refuses_existing(env):
@@ -368,7 +375,7 @@ def test_name_resolves_in_vault(env):
     shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/other.age")
     editor(env, 'echo other >> "$1"')
     status, out = run([VIAGE, "other"], env)
-    assert status == 0 and "saved " + env["VIAGE_DIR"] + "/other.age" in out, out
+    assert status == 0 and "saved other.age" in out, out
     status, out = run(["sh", "-c", f'"{VIAGE}" cat other.age > /dev/null'], env)
     assert status == 0, out
     status, out = run([VIAGE, "missing"], env)
@@ -386,7 +393,7 @@ def test_add_from_ram(env):
     status, out = run([VIAGE, "add", src], env)
     assert status == 0, out
     dest = env["VIAGE_DIR"] + "/api-token.age"
-    assert "added " + dest + "; removed " + src in out, out
+    assert "added api-token.age; removed " + src in out, out
     if sys.platform == "darwin":
         # A RAM disk cannot be told from any other volume there, so
         # viage warns as it would for a file on disk.
@@ -453,12 +460,12 @@ def test_add_own_passphrase_in_place(env):
     own_passphrase_file(env, hdr)
     os.chmod(hdr, 0o644)
     status, out = run([VIAGE, "add", hdr], env, [PASS, "their pass"])
-    assert status == 0 and "re-encrypted " + hdr in out, out
+    assert status == 0 and "re-encrypted hdr.age" in out, out
     assert plaintext(env, path=hdr) == "luks header\n"
     assert mode(hdr) == 0o600
     # Now it is under the vault identity, rekey covers it.
     status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
-    assert status == 0 and "rekeyed " + hdr in out, out
+    assert status == 0 and "rekeyed hdr.age" in out, out
     assert plaintext(env, NEWPASS, hdr) == "luks header\n"
 
 
@@ -580,7 +587,7 @@ def test_rekey_covers_hidden_files(env):
     assert status == 0, out
     hidden = env["VIAGE_DIR"] + "/.hidden.age"
     status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
-    assert status == 0 and "rekeyed " + hidden in out, out
+    assert status == 0 and "rekeyed .hidden.age" in out, out
     assert plaintext(env, NEWPASS, hidden) == "hidden\n"
 
 

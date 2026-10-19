@@ -158,7 +158,7 @@ flags:
 		name := filepath.Base(it.dest)
 		if it.skip {
 			if m := ix.Files[name]; m != nil && m.SHA256 == checksum(it.orig) && (describe == "" || m.Description == describe) {
-				warn("%s is already in the vault", it.dest)
+				warn("%s is already in the vault", shown(it.dest))
 				continue
 			}
 			ix.record(name, it.orig)
@@ -166,7 +166,7 @@ flags:
 				ix.Files[name].Description = describe
 			}
 			ix.save(id)
-			warn("%s is already in the vault; recorded it in the index", it.dest)
+			warn("%s is already in the vault; recorded it in the index", shown(it.dest))
 			continue
 		}
 		exposed := !it.imported && !isRAM(it.src)
@@ -183,18 +183,18 @@ flags:
 		}
 		ix.save(id)
 		if it.inPlace {
-			warn("re-encrypted %s to the vault identity", it.dest)
+			warn("re-encrypted %s to the vault identity", shown(it.dest))
 			continue
 		}
 		switch now, err := os.ReadFile(it.src); {
 		case keep:
-			warn("added %s; kept %s", it.dest, it.src)
+			warn("added %s; kept %s", shown(it.dest), it.src)
 		case err != nil || !bytes.Equal(now, it.orig):
-			warn("added %s; kept %s, which changed while it was being added", it.dest, it.src)
+			warn("added %s; kept %s, which changed while it was being added", shown(it.dest), it.src)
 		case os.Remove(it.src) != nil:
-			warn("added %s; could not remove %s", it.dest, it.src)
+			warn("added %s; could not remove %s", shown(it.dest), it.src)
 		default:
-			warn("added %s; removed %s", it.dest, it.src)
+			warn("added %s; removed %s", shown(it.dest), it.src)
 		}
 		if exposed {
 			warn("warning: %s was plaintext on persistent storage. Deleting it does", it.src)

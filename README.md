@@ -5,9 +5,9 @@ the way `vipw` edits the password file.
 
 ```
 $ viage
-Enter passphrase for identity file "/home/me/.local/share/viage/identity.age":
+Enter passphrase:
   ... editor opens, you edit, you save and quit ...
-viage: saved /home/me/.local/share/viage/secrets.age
+viage: saved secrets.age
 ```
 
 One passphrase prompt per edit. The plaintext exists only in a RAM-backed

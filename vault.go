@@ -396,7 +396,13 @@ func unlock() *age.X25519Identity {
 	if err != nil {
 		die("cannot read %s: %v", identityPath, err)
 	}
-	p := readPassphrase(fmt.Sprintf("Enter passphrase for identity file \"%s\": ", identityPath))
+	// The path only when it is not the usual identity, so an unusual
+	// one stands out.
+	prompt := "Enter passphrase: "
+	if identityPath != filepath.Join(vaultDir, "identity.age") {
+		prompt = fmt.Sprintf("Enter passphrase for %s: ", identityPath)
+	}
+	p := readPassphrase(prompt)
 	sid, err := age.NewScryptIdentity(p)
 	if err != nil {
 		die("cannot unlock identity")

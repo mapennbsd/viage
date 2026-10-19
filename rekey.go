@@ -202,7 +202,7 @@ func cmdRekey() {
 	setRekeying("")
 
 	for _, it := range items {
-		warn("rekeyed %s", it.path)
+		warn("rekeyed %s", shown(it.path))
 	}
 	warn("new identity in %s. Update every copy of the passphrase", identityPath)
 	warn("and of %s kept elsewhere. Older copies of the identity,", filepath.Base(identityPath))
