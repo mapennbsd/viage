@@ -170,14 +170,13 @@ echo 'tmpfs /home/you/.viage-tmp tmpfs rw,size=64m,mode=700,uid=1000,gid=1000 0 
 mount /home/you/.viage-tmp
 ```
 
-On OpenBSD, an mfs. Check its owner and mode once it is mounted
-(`ls -ld`) and make it yours, mode 700:
+On OpenBSD, an mfs. Each new mfs takes the owner and mode of the
+directory it is mounted on, so it comes up yours at every boot:
 
 ```
 install -d -o you -g you -m 700 /home/you/.viage-tmp
 echo 'swap /home/you/.viage-tmp mfs rw,nodev,nosuid,-s=64m 0 0' >> /etc/fstab
 mount /home/you/.viage-tmp
-chown you:you /home/you/.viage-tmp && chmod 700 /home/you/.viage-tmp
 ```
 
 Then, in your shell profile:
