@@ -1,5 +1,8 @@
 package main
 
+// Hardening the process on Linux: no core dumps, and memory that
+// other processes running as the same user cannot read.
+
 import (
 	"fmt"
 
