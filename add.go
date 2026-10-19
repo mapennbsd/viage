@@ -21,6 +21,21 @@ func addDest(src string) string {
 	return filepath.Join(vaultDir, b)
 }
 
+// sameEntry is true when a and b are one directory entry, not merely
+// two names (hard links) for one file.
+func sameEntry(a, b string) bool {
+	return filepath.Base(a) == filepath.Base(b) && sameFile(filepath.Dir(a), filepath.Dir(b)) && sameFile(a, b)
+}
+
+// links is the number of hard links to path, or 0.
+func links(path string) uint64 {
+	var st unix.Stat_t
+	if unix.Lstat(path, &st) != nil {
+		return 0
+	}
+	return uint64(st.Nlink)
+}
+
 func sameFile(a, b string) bool {
 	fa, err := os.Stat(a)
 	if err != nil {
@@ -85,7 +100,9 @@ flags:
 		if filepath.Base(dest) == indexName {
 			die("%s is the name of the index; rename the file first", indexName)
 		}
-		if exists(dest) && !sameFile(f, dest) {
+		// Another name for the destination is not the destination: a
+		// hard link outside the vault would keep the plaintext.
+		if exists(dest) && !sameEntry(f, dest) {
 			die("%s exists", dest)
 		}
 		if seen[dest] {
@@ -96,17 +113,23 @@ flags:
 
 	id := unlock()
 	ix := mustLoadIndex(id, "nothing added")
-	ix.adopt(id)
 	var items []addItem
 	for _, f := range args {
 		orig, err := os.ReadFile(f)
 		if err != nil {
 			die("cannot read %s: %v; nothing added", f, err)
 		}
-		it := addItem{src: f, dest: addDest(f), orig: orig, inPlace: sameFile(f, addDest(f))}
+		it := addItem{src: f, dest: addDest(f), orig: orig, inPlace: sameEntry(f, addDest(f))}
 		switch ageKind(f) {
 		case "none":
+			// Removing or replacing one name leaves the plaintext in
+			// the others.
+			if n := links(f); n > 1 && (it.inPlace || !keep) {
+				die("%s has %d other hard links, which would keep the plaintext; remove them first; nothing added", f, n-1)
+			}
 			it.plain = orig
+		case "unreadable":
+			die("cannot read %s; nothing added", f)
 		case "scrypt":
 			warn("%s has a passphrase of its own; enter it to bring the file in.", f)
 			p := readPassphrase(fmt.Sprintf("Enter passphrase for \"%s\": ", f))

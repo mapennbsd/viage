@@ -59,7 +59,7 @@ func cmdList(verbose bool) {
 			warn("warning: %v. Descriptions and checksums are not shown.", err)
 			ix = nil
 		case ix.isNew:
-			warn("warning: %s is missing; the next add, edit or describe creates it.", indexPath())
+			warn("warning: %s is missing; %s init makes a new one from the vault as it is now.", indexPath(), prog)
 			ix = nil
 		}
 	}
@@ -82,7 +82,7 @@ func cmdList(verbose bool) {
 			note = "not a regular file"
 		case sameFile(path, identityPath):
 			note = "identity"
-		case strings.Contains(name, ".new."):
+		case newName.MatchString(name):
 			note = "unsaved edit; recover or remove it"
 		case strings.HasSuffix(name, ".rekey"), strings.HasSuffix(name, ".old"):
 			note = "left by an unfinished rekey"
@@ -111,6 +111,8 @@ func cmdList(verbose bool) {
 				note = "NOT ENCRYPTED"
 			case "damaged":
 				note = "damaged age header"
+			case "unreadable":
+				note = "cannot be read"
 			default:
 				note = "another kind of key; rekey skips it"
 			}

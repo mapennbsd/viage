@@ -47,10 +47,11 @@ viage keeps secrets out of that path:
 - **Unlocking takes a human.** viage reads the passphrase from the
   terminal only, never from an environment variable, file or pipe. Do not
   store the passphrase anywhere an agent can read it.
-- **The key never touches a disk.** The decrypted identity, which opens
-  every file in the vault and every old copy of it, stays in viage's
-  memory. On Linux that memory cannot be read by other processes running
-  as you.
+- **The key is never written to a file.** The decrypted identity, which
+  opens every file in the vault and every old copy of it, stays in
+  viage's memory. On Linux that memory cannot be read by other processes
+  running as you. Swap can still page it out; see
+  [Swap](#what-it-protects-against-and-what-it-does-not).
 - **The plaintext window is short.** Only the file you edit is written
   out, to a private directory in RAM that is removed when the editor
   exits. `cat`, `add` and `rekey` write no plaintext at all.
@@ -131,6 +132,12 @@ and macOS, use `-g wheel`.
 - `index.age`: descriptions and checksums of the vault files (see
   [Descriptions and checksums](#descriptions-and-checksums)).
 
+A vault made by the shell versions of viage has no `index.age`. Run
+`viage init` once to make it: with an identity already there, init
+creates only the index, taking every file that opens with the identity
+as it is now, and lists them. Commands that write the vault refuse to
+run until there is an index.
+
 All are safe to keep on shared or backed-up storage. To recover the vault
 you need the passphrase and a copy of `identity.age`; keep both somewhere
 other than where the vault lives.
@@ -171,7 +178,8 @@ it is missing. A name with a slash (`./notes.age`, `/mnt/x.age`) is a path.
 Quit the editor with an error (`:cq` in vim) to discard your changes.
 If the content did not change, the file is not rewritten. A file that
 holds binary data, such as a LUKS header, is not opened in the editor;
-use `viage cat` to get it out.
+use `viage cat` to get it out. Neither is a backup (`*.age.bak`), which
+`viage cat` shows.
 
 Like `vipw`, viage writes the vault one command at a time. `edit`, `add`,
 `describe`, `rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
@@ -187,8 +195,9 @@ viage is running.
 Every file in `$VIAGE_DIR` should be encrypted to the vault identity, so
 that one passphrase opens all of it and `rekey` covers all of it. Keep
 files under other keys somewhere else, and keep vault files directly in
-`$VIAGE_DIR`, not in subdirectories or behind symlinks; rekey refuses to
-run while any are there. For a separate compartment, with
+`$VIAGE_DIR`: not in subdirectories, not behind symlinks, not with other
+hard links. Rekey refuses to run while any are there (see
+[Changing the passphrase](#changing-the-passphrase)). For a separate compartment, with
 its own passphrase, make a second vault: another directory with its own
 `identity.age`, used with `VIAGE_DIR=... viage`.
 
@@ -248,19 +257,23 @@ checks every file against its checksum. It flags:
   vault, or a viage interrupted between writing a file and the index.
   Check it with `viage cat`. `viage add` on the file records it as it is.
 - **MISSING:** in the index, but not in the vault.
-- **not in the index:** a vault file viage has not written since the
-  index was made; `viage add` records it.
+- **not in the index:** a file that opens with the identity but that
+  viage did not write. Check it with `viage cat`; `viage add` on the
+  file records it.
 
 age encryption does not prove who wrote a file: anyone who knows your
 public key can encrypt to it. So the index also carries an HMAC keyed
-from the identity, and viage refuses an index that does not verify. A
-command that writes the vault stops rather than go on with it; move
-`index.age` out of the vault to continue without one. The next command
-that writes the vault makes a new index and records every file that
-opens with the identity, as it is at that moment.
+from the identity, and viage refuses an index that does not verify.
+Commands that write the vault stop rather than go on with it, or
+without one. To start over, move `index.age` out of the vault and run
+`viage init`, which makes a new index from every file that opens with
+the identity, as it is at that moment. Nothing else rebuilds the index,
+so a missing one never quietly becomes a fresh start.
 
-The index cannot notice the whole vault, index included, being replaced
-by an older copy; only your own backups can tell you that.
+What the index checks is the vault against the index that is there. It
+cannot notice the whole vault, index included, being replaced by an
+older copy, and once `index.age` is removed and init has run, it has no
+memory of what came before. Only your own backups can tell you that.
 
 ### Copying a secret
 
@@ -307,8 +320,9 @@ passphrase from the terminal.
 ### Changing the passphrase
 
 `viage rekey` makes a new identity under a new passphrase and re-encrypts
-every `*.age` and `*.age.bak` file in `$VIAGE_DIR` to it, hidden files
-included, along with the index. The old identity
+to it every file in `$VIAGE_DIR` that opens with the identity, along with
+the index. It goes by what is in a file, not by its name, so hidden
+files, backups and a default vault with another suffix are covered. The old identity
 is replaced, not re-wrapped, because changing only the passphrase would
 not revoke the old one. Every copy of the old `identity.age` (snapshots,
 backups, a file server) would still open with the old passphrase, and it
@@ -327,19 +341,32 @@ A file in `$VIAGE_DIR` that the identity does not open is skipped with a
 warning and left as it is: one with its own passphrase (bring it in with
 `viage add`), one encrypted to another key, or one that is not encrypted.
 Skipping is safe, because a file the old identity cannot open is not
-exposed by it either. Rekey refuses to start when:
+exposed by it either.
 
-- a vault file is in a subdirectory or is a symlink, or the default vault
-  is outside `$VIAGE_DIR` (rekey could not cover it, and the old identity
-  is deleted at the end),
-- an unsaved edit (`*.new.*`) is waiting, or
-- a previous rekey did not finish.
+The old identity is deleted at the end, so rekey refuses to start, and
+changes nothing, when anything could be left behind that only the old
+identity opens:
+
+- a file it cannot read, or a subdirectory it cannot search,
+- a subdirectory holding an age file, or a symlink,
+- a vault file with other hard links,
+- a default vault (`$VIAGE_FILE`) that is not directly in `$VIAGE_DIR`,
+- an unsaved edit (`*.new.*`) or a file left by an interrupted viage, or
+- a previous rekey that did not finish.
+
+It also checks every file against the index first, so that changing the
+passphrase never accepts a file changed outside viage. A file that is
+not in the index, or does not match it, stops the rekey; check it with
+`viage cat`, and `viage add` on it records it as it is. A file in the
+index that is gone from the vault is dropped from the index, with a
+warning: a copy kept elsewhere opens only with the old identity.
 
 Then the files are renamed into place, the identity first. Signals are
 ignored during the renames, but a crash, a power loss or a failing disk
 can still stop them partway. The old identity is kept as
-`identity.age.old` until every file is in place, so that state can be
-recovered by hand, and the vault stays locked until it is:
+`identity.age.old` until every file is in place and flushed to disk; if
+the flush fails, it stays. An interrupted rename can be recovered by
+hand, and the vault stays locked until it is:
 
 - If `identity.age` is missing, rename `identity.age.rekey` to it.
 - `identity.age` is then the new identity, and `identity.age.old` the old
@@ -381,7 +408,10 @@ you keep elsewhere.
    only if its name is new, mode 600, flushed to disk and read back; the
    rename replaces the old name rather than writing through it, so a
    symlink planted in the vault directory cannot redirect a write.
-5. Remove the private directory and the lock, on any exit.
+5. Remove the private directory and the lock, on any exit. If viage is
+   sent HUP or TERM while the editor is open, it passes the signal on,
+   kills the editor if it has not exited five seconds later, and waits
+   for it before tidying up.
 
 ## What it protects against, and what it does not
 
@@ -399,13 +429,16 @@ running as you cannot read its memory or its `/proc` files.
 
 Points to be aware of:
 
-- **Swap.** tmpfs pages can be swapped out. Use encrypted swap, or zram
-  only. OpenBSD encrypts swap by default; on FreeBSD use an `.eli` swap
-  device.
+- **Swap.** The file being edited in tmpfs, and viage's own memory with
+  the identity and plaintext in it, can both be paged out to swap. Use
+  encrypted swap, or zram only. OpenBSD encrypts swap by default; on
+  FreeBSD use an `.eli` swap device.
 - **Core dumps.** viage sets the core size limit to 0, and the editor
   inherits it, so a crash does not write their memory, plaintext
   included, to a core file. systemd-coredump honors the limit: it logs
-  the crash and stores no core.
+  the crash and stores no core. If the limit, or on Linux the
+  non-dumpable flag, cannot be set, viage stops before it asks for the
+  passphrase.
 - **The editor.** vim and neovim are started with `--clean -n -i NONE` and
   undo, backup and write-backup files turned off: no swap file, no history
   file, and no user config or plugins. Other editors are run as they are,
@@ -420,7 +453,7 @@ Points to be aware of:
   a file with an older copy. age authenticates the content, so they
   cannot forge or alter it, and `list -v` flags a single file put back.
   Replacing the whole vault with an older copy, index included, goes
-  unnoticed.
+  unnoticed, and so does removing the index and running `viage init`.
 - **Platforms.** viage asks the kernel whether the plaintext directory
   is RAM-backed: tmpfs or ramfs on Linux, tmpfs on FreeBSD, mfs on
   OpenBSD (a tmpfs or mfs `/tmp` is found by itself). If the type cannot

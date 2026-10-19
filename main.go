@@ -50,7 +50,8 @@ func usage() string {
                                set or clear the description of a vault file
        %[1]s list [-v]         show what is in the vault; -v unlocks it to
                                show descriptions and check every file
-       %[1]s init              create the identity and an empty vault
+       %[1]s init              create the identity and an empty vault, or
+                               the index for a vault that has none
        %[1]s rekey             new identity and passphrase; re-encrypt the vault
        %[1]s -h | -V
 
@@ -123,7 +124,9 @@ func main() {
 	// Private files, no core dumps, and on Linux no reading of this
 	// process's memory by other processes running as the same user.
 	syscall.Umask(0o077)
-	harden()
+	if err := harden(); err != nil {
+		die("%v", err)
+	}
 	handleSignals()
 	configure()
 

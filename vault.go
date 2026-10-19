@@ -214,7 +214,7 @@ func publishOver(staged, dest string) {
 		die("cannot rename %s to %s: %v", staged, dest, err)
 	}
 	setPartial(staged, false)
-	syncDir(filepath.Dir(dest))
+	mustSyncDir(filepath.Dir(dest))
 }
 
 // publishNew gives a staged file the name dest, which must not exist.
@@ -234,15 +234,28 @@ func linkNew(staged, dest string) error {
 	}
 	os.Remove(staged)
 	setPartial(staged, false)
-	syncDir(filepath.Dir(dest))
+	mustSyncDir(filepath.Dir(dest))
 	return nil
 }
 
 // syncDir flushes a directory, so that a rename in it survives a crash.
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
+// A filesystem that cannot flush a directory at all (EINVAL, ENOTSUP)
+// is not an error: there is nothing more to be done there.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOTSUP) {
+		return err
+	}
+	return nil
+}
+
+func mustSyncDir(dir string) {
+	if err := syncDir(dir); err != nil {
+		die("cannot flush %s to disk: %v", dir, err)
 	}
 }
 
@@ -265,25 +278,32 @@ func openAge(r io.Reader) io.Reader {
 // ageKind tells what protects a file, from its age header, without
 // decrypting: "scrypt" (a passphrase of its own), "x25519" (a key,
 // perhaps the identity), another stanza type, "damaged" for an age file
-// whose header cannot be read, or "none" for a file that is not
-// age-encrypted.
+// whose header cannot be parsed, "none" for a file that is not
+// age-encrypted, or "unreadable" when the file cannot be read, which
+// says nothing about what is in it.
 func ageKind(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
-		return "none"
+		return "unreadable"
 	}
 	defer f.Close()
-	br := bufio.NewReader(f)
+	er := &errReader{r: f}
+	br := bufio.NewReader(er)
 	peek, _ := br.Peek(len(armor.Header))
 	var r io.Reader = br
 	switch {
+	case er.err != nil:
+		return "unreadable"
 	case string(peek) == armor.Header:
 		r = armor.NewReader(br)
 	case !bytes.HasPrefix(peek, []byte("age-encryption.org/")):
 		return "none"
 	}
 	hdr, err := age.ExtractHeader(r)
-	if err != nil {
+	switch {
+	case er.err != nil:
+		return "unreadable"
+	case err != nil:
 		return "damaged"
 	}
 	var types []string
@@ -301,6 +321,27 @@ func ageKind(path string) string {
 		return types[0]
 	}
 	return "unknown"
+}
+
+// errReader remembers a read error other than the end of the file.
+type errReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
+}
+
+// notOurs is true when decryption failed because the file is encrypted
+// to some other key, rather than because it is damaged.
+func notOurs(err error) bool {
+	var e *age.NoIdentityMatchError
+	return errors.As(err, &e)
 }
 
 func decrypt(ciphertext []byte, id age.Identity) ([]byte, error) {

@@ -280,6 +280,8 @@ def test_rekey(env):
     add_secret(env, "second=xyz")  # leaves a .bak holding the first version
     other = env["VIAGE_DIR"] + "/other.age"
     shutil.copy(env["VIAGE_FILE"], other)
+    status, out = run([VIAGE, "add", other], env)  # into the index
+    assert status == 0, out
     old_identity = read(env["VIAGE_IDENTITY"])
     shutil.copy(env["VIAGE_IDENTITY"], env["HOME"] + "/old-identity.age")
 
@@ -824,7 +826,7 @@ def test_forged_index_is_refused(env):
     editor(env, 'echo x >> "$1"')
     before = vault_state(env)
     status, out = run([VIAGE], env)
-    assert status != 0 and "not authentic" in out and "move it out" in out, out
+    assert status != 0 and "not authentic" in out and "move it out" in out.lower(), out
     assert vault_state(env) == before
 
 
@@ -860,17 +862,245 @@ def test_index_is_not_edited_directly(env):
 
 
 @go_only
-def test_index_adopts_an_older_vault(env):
+def test_missing_index_needs_init(env):
+    # A vault from before the index, or one whose index was removed:
+    # nothing that writes rebuilds it on the side. init does, on purpose.
     add_secret(env)
     shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/other.age")
     os.remove(env["VIAGE_DIR"] + "/index.age")
     out, rows = listing(env, "-v")
     assert "index.age is missing" in out, out
+    before = vault_state(env)
+    for args in (["describe", "other", "a copy"], ["rekey"]):
+        status, out = run([VIAGE, *args], env, [PASS, NEWPASS, NEWPASS])
+        assert status != 0 and "index.age is missing" in out and "init" in out, out
+        assert vault_state(env) == before
+    editor(env, 'echo x >> "$1"')
+    status, out = run([VIAGE], env)
+    assert status != 0 and "index.age is missing" in out, out
+    assert vault_state(env) == before
+    status, out = run([VIAGE, "init"], env)
+    assert status == 0, out
+    for n in ("secrets.age", "secrets.age.bak", "other.age"):
+        assert f"indexed {n} as it is now" in out, out
+    assert read(env["VIAGE_IDENTITY"]) == before["identity.age"]
     status, out = run([VIAGE, "describe", "other", "a copy"], env)
     assert status == 0, out
     out, rows = listing(env, "-v")
     assert "not in the index" not in out and "CHANGED" not in out, out
     assert rows["other.age"].endswith("  a copy"), out
+    status, out = run([VIAGE, "init"], env)
+    assert status != 0 and "exists" in out, out
+
+
+# --- 1.0.0: what the review of the Go version found
+
+
+def rekey_refused(env, needle, deep=False):
+    before = (vault_state_deep if deep else vault_state)(env)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status != 0 and needle in out, out
+    assert "Choose the new" not in out, out
+    assert (vault_state_deep if deep else vault_state)(env) == before
+    return out
+
+
+def add_from_ram(env, name, content="x\n"):
+    src = env["VIAGE_TMPDIR"] + "/" + name
+    with open(src, "w") as f:
+        f.write(content)
+    status, out = run([VIAGE, "add", src], env)
+    assert status == 0, out
+    return env["VIAGE_DIR"] + "/" + name + ".age"
+
+
+@go_only
+def test_rekey_covers_a_default_with_another_name(env):
+    default = env["VIAGE_DIR"] + "/default.enc"
+    shutil.copy(env["VIAGE_FILE"], default)
+    env = dict(env, VIAGE_FILE=default)
+    add_secret(env)  # saves default.enc and default.enc.bak
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0, out
+    assert plaintext(env, NEWPASS) == "token=abc123\n"
+    assert plaintext(env, NEWPASS, default + ".bak") == ""
+
+
+@go_only
+def test_rekey_refuses_a_default_outside_the_vault(env):
+    shutil.copy(env["VIAGE_FILE"], env["HOME"] + "/outside.age")
+    # Starts with the vault directory, but is not in it.
+    env = dict(env, VIAGE_FILE=env["VIAGE_DIR"] + "/../outside.age")
+    rekey_refused(env, "the default vault, is not directly in")
+    assert plaintext(env) == ""
+
+
+@go_only
+def test_rekey_refuses_an_unreadable_file(env):
+    if os.getuid() == 0:
+        return
+    locked = add_from_ram(env, "locked")
+    os.chmod(locked, 0)
+    try:
+        before = os.listdir(env["VIAGE_DIR"])
+        status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+        assert status != 0 and "cannot read " + locked in out, out
+        assert "not age-encrypted" not in out, out
+    finally:
+        os.chmod(locked, 0o600)
+    assert sorted(os.listdir(env["VIAGE_DIR"])) == sorted(before)
+    assert plaintext(env, PASS, locked) == "x\n"
+
+
+@go_only
+def test_rekey_refuses_an_unreadable_subdirectory(env):
+    if os.getuid() == 0:
+        return
+    sub = env["VIAGE_DIR"] + "/sub"
+    os.mkdir(sub)
+    shutil.copy(env["VIAGE_FILE"], sub + "/nested.age")
+    os.chmod(sub, 0)
+    try:
+        rekey_refused(env, "rekey must see every file")
+    finally:
+        os.chmod(sub, 0o700)
+
+
+@go_only
+def test_rekey_finds_age_files_by_content(env):
+    sub = env["VIAGE_DIR"] + "/sub"
+    os.mkdir(sub)
+    shutil.copy(env["VIAGE_FILE"], sub + "/notes.enc")
+    rekey_refused(env, "notes.enc is in a subdirectory", deep=True)
+
+
+@go_only
+def test_rekey_refuses_leftovers_and_hard_links(env):
+    staged = env["VIAGE_DIR"] + "/.secrets.age.aB3dE9"
+    shutil.copy(env["VIAGE_FILE"], staged)
+    rekey_refused(env, "left by an interrupted viage")
+    os.remove(staged)
+    os.link(env["VIAGE_FILE"], env["HOME"] + "/elsewhere.age")
+    rekey_refused(env, "other hard links")
+
+
+@go_only
+def test_backups_are_not_edited(env):
+    add_secret(env)
+    editor(env, 'echo x >> "$1"')
+    before = vault_state(env)
+    status, out = run([VIAGE, "secrets.age.bak"], env)
+    assert status != 0 and "is a backup" in out, out
+    assert "passphrase" not in out.lower(), out
+    assert vault_state(env) == before
+    status, out = run([VIAGE, "cat", "secrets.age.bak"], env)
+    assert status == 0, out
+
+
+@go_only
+def test_rekey_refuses_a_file_changed_outside_viage(env):
+    add_secret(env)
+    add_secret(env, "second=1")
+    shutil.copy(env["VIAGE_FILE"] + ".bak", env["VIAGE_FILE"])  # rolled back
+    out = rekey_refused(env, "secrets.age changed outside viage")
+    assert "viage add " + env["VIAGE_FILE"] in out, out
+    status, out = run([VIAGE, "add", env["VIAGE_FILE"]], env)
+    assert status == 0 and "recorded it in the index" in out, out
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0, out
+    assert plaintext(env, NEWPASS) == "token=abc123\n"
+
+
+@go_only
+def test_rekey_refuses_a_file_not_in_the_index(env):
+    # Anyone with the public key can make a file that decrypts.
+    shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/dropped.age")
+    rekey_refused(env, "dropped.age is not in the index")
+    status, out = run([VIAGE, "describe", "dropped", "x"], env)
+    assert status != 0 and "not in the index" in out, out
+
+
+@go_only
+def test_rekey_refuses_a_tracked_file_replaced_by_another_key(env):
+    gone = add_from_ram(env, "token")
+    foreign_key_file(env, gone)
+    rekey_refused(env, "token.age changed outside viage")
+
+
+@go_only
+def test_rekey_drops_missing_files_from_the_index(env):
+    gone = add_from_ram(env, "gone")
+    os.remove(gone)
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0 and "gone.age is in the index but not in" in out, out
+    out, rows = listing(env, "-v", passphrase=NEWPASS)
+    assert "MISSING" not in out, out
+
+
+@go_only
+def test_add_refuses_a_hard_link_to_the_destination(env):
+    src = env["HOME"] + "/doc.age"
+    with open(src, "w") as f:
+        f.write("plain\n")
+    os.link(src, env["VIAGE_DIR"] + "/doc.age")
+    status, out = run([VIAGE, "add", src], env)
+    assert status != 0 and "exists" in out, out
+    assert read(src) == b"plain\n"
+
+
+@go_only
+def test_add_refuses_plaintext_with_other_hard_links(env):
+    src = env["VIAGE_TMPDIR"] + "/token"
+    with open(src, "w") as f:
+        f.write("tok\n")
+    os.link(src, env["VIAGE_TMPDIR"] + "/token.copy")
+    status, out = run([VIAGE, "add", src], env)
+    assert status != 0 and "other hard links" in out, out
+    assert not os.path.exists(env["VIAGE_DIR"] + "/token.age")
+    status, out = run([VIAGE, "add", "-k", src], env)
+    assert status == 0, out
+
+
+@go_only
+def test_term_to_viage_alone_stops_the_editor(env):
+    # viage under a shell that outlives it, so no terminal hangup
+    # reaches the editor: only viage itself can stop it.
+    import select, signal, time
+    home = env["HOME"]
+    editor(env, f'echo $$ > {home}/editor.pid; exec sleep 30')
+    script = f'{VIAGE} & echo $! > {home}/viage.pid; wait; sleep 1'
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("sh", ["sh", "-c", script], env)
+    out, pending, sent, deadline = b"", b"", False, time.time() + 20
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            out += data
+            pending += data
+            if b"passphrase" in pending.lower() and pending.rstrip().endswith(b":"):
+                os.write(fd, PASS.encode() + b"\n")
+                pending = b""
+        if not sent and os.path.exists(home + "/editor.pid") and os.path.getsize(home + "/editor.pid"):
+            time.sleep(0.2)
+            os.kill(int(open(home + "/viage.pid").read()), signal.SIGTERM)
+            sent = True
+    os.waitpid(pid, 0)
+    out = out.decode(errors="replace")
+    assert sent, out
+    assert "stopped by a signal (terminated)" in out, out
+    try:
+        os.kill(int(open(home + "/editor.pid").read()), 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive, "the editor outlived viage"
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
@@ -885,9 +1115,9 @@ def main():
             assert not ram_leftovers(env), ram_leftovers(env)
             assert not vault_leftovers(env), vault_leftovers(env)
             print(f"ok   {test.__name__}")
-        except AssertionError as e:
+        except Exception as e:
             failed += 1
-            print(f"FAIL {test.__name__}\n{e}")
+            print(f"FAIL {test.__name__}\n{e!r}" if not isinstance(e, AssertionError) else f"FAIL {test.__name__}\n{e}")
         finally:
             teardown(env)
     print(f"{len(TESTS) - failed}/{len(TESTS)} passed")

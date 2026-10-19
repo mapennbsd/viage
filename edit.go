@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"filippo.io/age"
 	"golang.org/x/sys/unix"
@@ -15,6 +16,10 @@ import (
 )
 
 func cmdInit() {
+	if exists(identityPath) && !exists(indexPath()) {
+		initIndex()
+		return
+	}
 	for _, f := range []string{identityPath, vaultFile, indexPath()} {
 		if exists(f) {
 			die("%s exists", f)
@@ -44,6 +49,28 @@ func cmdInit() {
 	fmt.Fprintf(os.Stderr, "created %s\ncreated %s\n", identityPath, vaultFile)
 	fmt.Fprintf(os.Stderr, "Back up the passphrase. Without it and %s the vault is lost.\n",
 		filepath.Base(identityPath))
+}
+
+// initIndex makes the index for a vault that has none: one made before
+// there was an index, or one whose index was moved out because it could
+// not be trusted. Every file that decrypts with the identity is taken as
+// it is now, so this is a deliberate step, never a side effect.
+func initIndex() {
+	checkWritable()
+	requireIdentity()
+	lockVault()
+	id := unlock()
+	if exists(indexPath()) {
+		die("%s exists", indexPath())
+	}
+	ix := &vaultIndex{Files: map[string]*fileMeta{}, isNew: true}
+	names := ix.adopt(id)
+	publishNew(stage(ix.seal(id), indexPath()), indexPath())
+	for _, n := range names {
+		warn("indexed %s as it is now", n)
+	}
+	warn("created %s. The files above are taken as they are now; check any", indexPath())
+	warn("you are unsure of with %s cat. Files not listed are left out.", prog)
 }
 
 // Say where cat's output is going and what will keep a copy of it.
@@ -126,6 +153,11 @@ func cmdEdit() {
 	if name == indexName {
 		die("%s is kept by %s; change descriptions with %s describe", vaultFile, prog, prog)
 	}
+	// Saving makes a backup of the file edited, and a backup of a backup
+	// is one more file to keep track of for no gain.
+	if strings.HasSuffix(vaultFile, ".age.bak") {
+		die("%s is a backup, which edit leaves as it is; %s cat shows it", vaultFile, prog)
+	}
 	mktmp()
 	// For the whole session, editor included, as vipw does.
 	lockVault()
@@ -156,6 +188,10 @@ func cmdEdit() {
 	setEditing(true)
 	err = runEditor(words, plain)
 	setEditing(false)
+	if sig := editorStopped(); sig != nil {
+		warn("stopped by a signal (%v); changes discarded", sig)
+		exit(128 + int(sig.(syscall.Signal)))
+	}
 	if err != nil {
 		die("editor exited with an error; changes discarded")
 	}
@@ -177,7 +213,6 @@ func cmdEdit() {
 	publishOver(stage(orig, vaultFile+".bak"), vaultFile+".bak")
 	publishOver(stage(ct, vaultFile), vaultFile)
 	if ix != nil {
-		ix.adopt(id)
 		ix.record(name+".bak", orig)
 		ix.record(name, ct)
 		ix.save(id)
@@ -216,7 +251,12 @@ func runEditor(words []string, file string) error {
 	cmd := exec.Command(words[0], args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), "TMPDIR="+tmpDir)
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	setEditor(cmd.Process)
+	defer setEditor(nil)
+	return cmd.Wait()
 }
 
 func isVim(path string) bool {

@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 )
 
@@ -25,24 +29,24 @@ type rekeyItem struct {
 }
 
 // cmdRekey replaces the identity with a new one under a new passphrase
-// and re-encrypts every vault file to it: each *.age and *.age.bak
-// directly in the vault directory, hidden ones included. Anything rekey
-// cannot cover (a vault file in a subdirectory or behind a symlink, the
-// default vault outside the vault directory) stops it before it starts,
-// since the old identity is deleted at the end. Files that are not
-// encrypted to the identity are skipped with a warning. Everything is
-// written and checked before anything is renamed into place. Copies of
-// the old identity elsewhere (snapshots, backups) still open the files
-// as they were before.
+// and re-encrypts the vault to it. The old identity is deleted at the
+// end, so rekey must leave nothing behind that only the old identity
+// opens. It looks at every file in the vault directory, by what is in
+// it rather than by its name, and stops before changing anything at
+// whatever it cannot account for: a file it cannot read, a symlink, a
+// subdirectory holding age files, a file with other hard links, a
+// default vault that is not directly in the vault directory, leftovers
+// of an earlier run. Every file encrypted to the identity must be in
+// the index and match it, so that changing the passphrase never quietly
+// accepts a file changed outside viage. Files encrypted to anything
+// else are skipped with a warning; the old identity does not open them
+// either. Everything is written and checked before anything is renamed
+// into place. Copies of the old identity elsewhere (snapshots, backups)
+// still open the files as they were before.
 func cmdRekey() {
 	checkWritable()
 	requireIdentity()
 	lockVault()
-	if !strings.HasPrefix(vaultFile, vaultDir+"/") {
-		if fi, err := os.Stat(vaultFile); err == nil && fi.Mode().IsRegular() {
-			die("%s is outside %s; rekey works on %s only", vaultFile, vaultDir, vaultDir)
-		}
-	}
 	for _, f := range []string{identityPath + ".old", identityPath + ".rekey"} {
 		if exists(f) {
 			die("%s exists; a previous rekey did not finish", f)
@@ -52,32 +56,40 @@ func cmdRekey() {
 	for _, name := range vaultEntries() {
 		path := filepath.Join(vaultDir, name)
 		fi, err := os.Lstat(path)
-		if err != nil || name == ".lock" {
-			continue
+		if err != nil {
+			die("cannot read %s: %v; nothing changed", path, err)
 		}
 		switch {
+		case name == ".lock" && fi.IsDir(), sameEntry(path, identityPath):
+			continue
 		case strings.HasSuffix(name, ".rekey"):
 			die("%s exists; a previous rekey did not finish", path)
-		case strings.Contains(name, ".new."):
+		case newName.MatchString(name):
 			die("%s holds an unsaved edit; recover or remove it first", path)
+		case stagedName.MatchString(name):
+			die("%s was left by an interrupted %s; remove it first", path, prog)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			die("%s is a symlink, which rekey does not follow; replace it with the file, or move it out of %s", path, vaultDir)
 		case fi.IsDir():
-			if nested := findVaultFile(path); nested != "" {
+			nested, err := findAgeFile(path)
+			if err != nil {
+				die("%v, and rekey must see every file before it replaces the identity; nothing changed", err)
+			}
+			if nested != "" {
 				die("%s is in a subdirectory, which rekey does not cover; move it into %s or out of it", nested, vaultDir)
 			}
 			continue
-		}
-		if !isVaultName(name) || name == indexName {
-			continue
-		}
-		if fi.Mode()&fs.ModeSymlink != 0 {
-			die("%s is a symlink, which rekey does not follow; replace it with the file", path)
-		}
-		if !fi.Mode().IsRegular() || sameFile(path, identityPath) {
+		case !fi.Mode().IsRegular() || name == indexName:
 			continue
 		}
 		switch ageKind(path) {
 		case "x25519":
+			if n := links(path); n > 1 {
+				die("%s has %d other hard links, which rekey would leave encrypted to the old identity; nothing changed", path, n-1)
+			}
 			paths = append(paths, path)
+		case "unreadable":
+			die("cannot read %s, and rekey must see every file before it replaces the identity; nothing changed", path)
 		case "scrypt":
 			warn("skipping %s: it has its own passphrase (%s add brings it in)", path, prog)
 		case "none":
@@ -88,28 +100,68 @@ func cmdRekey() {
 			warn("skipping %s: it is encrypted to another kind of key", path)
 		}
 	}
+	// The default vault must be one of them, however VIAGE_FILE names it.
+	switch fi, err := os.Stat(vaultFile); {
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		die("cannot read %s: %v; nothing changed", vaultFile, err)
+	case err == nil && fi.Mode().IsRegular() && !slices.ContainsFunc(paths, func(p string) bool { return sameEntry(vaultFile, p) }):
+		if k := ageKind(vaultFile); k == "x25519" || k == "unreadable" {
+			die("%s, the default vault, is not directly in %s, which is all rekey covers; nothing changed", vaultFile, vaultDir)
+		}
+	}
 	if len(paths) == 0 {
 		die("no vault files in %s", vaultDir)
 	}
 
 	id := unlock()
 	ix := mustLoadIndex(id, "nothing changed")
-	ix.adopt(id)
 	var items []rekeyItem
+	var problems []string
 	for _, p := range paths {
 		orig, err := os.ReadFile(p)
 		if err != nil {
 			die("cannot read %s: %v; nothing changed", p, err)
 		}
 		plain, err := decrypt(orig, id)
-		if err != nil {
+		switch {
+		case notOurs(err):
 			warn("skipping %s: it does not decrypt with this identity", p)
 			continue
+		case err != nil:
+			die("%s is encrypted to this identity but does not decrypt: %v; nothing changed", p, err)
+		}
+		switch m := ix.Files[filepath.Base(p)]; {
+		case m == nil:
+			problems = append(problems, fmt.Sprintf("%s is not in the index; check it with %s cat, then %s add %s brings it in", p, prog, prog, p))
+		case m.SHA256 != checksum(orig):
+			problems = append(problems, fmt.Sprintf("%s changed outside %s; check it with %s cat, then %s add %s takes it as it is", p, prog, prog, prog, p))
 		}
 		items = append(items, rekeyItem{p, orig, plain})
 	}
+	var gone []string
+	for name := range ix.Files {
+		path := filepath.Join(vaultDir, name)
+		switch {
+		case !exists(path):
+			gone = append(gone, name)
+		case !slices.ContainsFunc(items, func(it rekeyItem) bool { return it.path == path }):
+			problems = append(problems, fmt.Sprintf("%s changed outside %s: it is in the index, but no longer encrypted to this identity", path, prog))
+		}
+	}
+	for _, pr := range problems {
+		warn("%s", pr)
+	}
+	if len(problems) > 0 {
+		die("nothing changed")
+	}
 	if len(items) == 0 {
 		die("nothing in %s decrypts with this identity; nothing changed", vaultDir)
+	}
+	sort.Strings(gone)
+	for _, name := range gone {
+		warn("%s is in the index but not in %s; dropping it. A copy kept", name, vaultDir)
+		warn("elsewhere opens only with the old identity.")
+		delete(ix.Files, name)
 	}
 
 	os.Stderr.WriteString("Choose the new vault passphrase.\n")
@@ -124,18 +176,14 @@ func cmdRekey() {
 		if now, err := os.ReadFile(it.path); err != nil || !bytes.Equal(now, it.orig) {
 			die("%s changed during the rekey; nothing changed", it.path)
 		}
-		if m := ix.Files[filepath.Base(it.path)]; m != nil {
-			m.SHA256 = checksum(ct)
-		} else {
-			ix.record(filepath.Base(it.path), ct)
-		}
+		ix.Files[filepath.Base(it.path)].SHA256 = checksum(ct)
 	}
 	// The index goes with the files, authenticated by the new identity.
 	publishOver(stage(ix.seal(newID), indexPath()), indexPath()+".rekey")
 
 	// The identity goes first and the old one is kept until every file
-	// is in place, so an interruption leaves something recoverable.
-	// Signals are ignored from here on.
+	// is in place and on disk, so an interruption or a failing disk
+	// leaves something recoverable. Signals are ignored from here on.
 	setRekeying("committing")
 	mustRename(identityPath, identityPath+".old")
 	mustRename(identityPath+".rekey", identityPath)
@@ -143,10 +191,14 @@ func cmdRekey() {
 		mustRename(it.path+".rekey", it.path)
 	}
 	mustRename(indexPath()+".rekey", indexPath())
-	syncDir(filepath.Dir(identityPath))
-	syncDir(vaultDir)
+	if err := errors.Join(syncDir(filepath.Dir(identityPath)), syncDir(vaultDir)); err != nil {
+		setRekeying("")
+		die("every file is renamed into place, but flushing them to disk failed: %v. The old identity stays in %s.old until the disk is known to be good", err, identityPath)
+	}
 	os.Remove(identityPath + ".old")
-	syncDir(filepath.Dir(identityPath))
+	if err := syncDir(filepath.Dir(identityPath)); err != nil {
+		warn("warning: flushing %s failed: %v", filepath.Dir(identityPath), err)
+	}
 	setRekeying("")
 
 	for _, it := range items {
@@ -164,15 +216,31 @@ func mustRename(from, to string) {
 	}
 }
 
-// findVaultFile returns a vault file somewhere under dir, or "".
-func findVaultFile(dir string) string {
+// findAgeFile returns a file under dir that may be encrypted to the
+// identity, by its name or by what is in it, or "". A directory or file
+// it cannot read is an error: it might hold one.
+func findAgeFile(dir string) (string, error) {
 	found := ""
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && (strings.HasSuffix(p, ".age") || strings.HasSuffix(p, ".age.bak")) {
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case d.IsDir():
+			return nil
+		case isVaultName(d.Name()):
 			found = p
+		case d.Type().IsRegular():
+			switch ageKind(p) {
+			case "x25519":
+				found = p
+			case "unreadable":
+				return fmt.Errorf("cannot read %s", p)
+			}
+		}
+		if found != "" {
 			return filepath.SkipAll
 		}
 		return nil
 	})
-	return found
+	return found, err
 }

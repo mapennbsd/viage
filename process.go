@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -21,8 +22,10 @@ var (
 	lockDir    string              // the vault lock, while held
 	termFd     = -1                // a terminal whose state to restore
 	termState  *term.State
-	committing bool // ignore signals: rekey is renaming files into place
-	editing    bool // ignore ^C and ^\: they are meant for the editor
+	committing bool        // ignore signals: rekey is renaming files into place
+	editing    bool        // ignore ^C and ^\: they are meant for the editor
+	editor     *os.Process // the editor, while it runs
+	stopping   os.Signal   // a HUP or TERM that arrived while it ran
 )
 
 func warn(format string, a ...any) {
@@ -83,6 +86,17 @@ func handleSignals() {
 				mu.Unlock()
 				continue
 			}
+			// The editor holds the plaintext open and needs the lock
+			// to be saved, so viage stops it and waits for it to exit
+			// before tidying up. See stopEditor.
+			if editing {
+				if stopping == nil {
+					stopping = sig
+					stopEditor()
+				}
+				mu.Unlock()
+				continue
+			}
 			cleanup()
 			os.Exit(128 + int(sig))
 		}
@@ -110,4 +124,33 @@ func setEditing(on bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	editing = on
+}
+
+// setEditor records the running editor, and stops it at once if a
+// signal came while it was being started.
+func setEditor(p *os.Process) {
+	mu.Lock()
+	defer mu.Unlock()
+	editor = p
+	if p != nil && stopping != nil {
+		stopEditor()
+	}
+}
+
+// stopEditor, with mu held, passes the signal on to the editor, and
+// kills it if it is still running five seconds later.
+func stopEditor() {
+	if editor == nil {
+		return
+	}
+	p := editor
+	p.Signal(stopping)
+	time.AfterFunc(5*time.Second, func() { p.Kill() })
+}
+
+// editorStopped is the signal that stopped the edit, if any.
+func editorStopped() os.Signal {
+	mu.Lock()
+	defer mu.Unlock()
+	return stopping
 }

@@ -207,3 +207,86 @@ func TestLsDate(t *testing.T) {
 		t.Errorf("old: %q", got)
 	}
 }
+
+func TestAgeKindUnreadable(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads anything")
+	}
+	id, _ := age.GenerateX25519Identity()
+	p := filepath.Join(t.TempDir(), "locked.age")
+	writeFile(t, p, encrypt([]byte("a"), id.Recipient(), false))
+	os.Chmod(p, 0)
+	// Not "none": a file that cannot be read may well be encrypted.
+	if got := ageKind(p); got != "unreadable" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestSameEntry(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.age")
+	writeFile(t, a, []byte("x"))
+	other := filepath.Join(t.TempDir(), "a.age")
+	if err := os.Link(a, other); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "dir")
+	os.Symlink(dir, link)
+	for _, c := range []struct {
+		b    string
+		want bool
+	}{
+		{a, true},
+		{filepath.Join(dir, ".", "a.age"), true},
+		{filepath.Join(link, "a.age"), true},
+		{other, false}, // a hard link: another entry for the same file
+	} {
+		if got := sameEntry(c.b, a); got != c.want {
+			t.Errorf("sameEntry(%q) = %v, want %v", c.b, got, c.want)
+		}
+	}
+	if links(a) != 2 {
+		t.Errorf("links = %d", links(a))
+	}
+}
+
+func TestFindAgeFile(t *testing.T) {
+	id, _ := age.GenerateX25519Identity()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "notes.txt"), []byte("plain"))
+	if f, err := findAgeFile(dir); f != "" || err != nil {
+		t.Errorf("plain only: %q %v", f, err)
+	}
+	// Found by what is in it, whatever the name.
+	enc := filepath.Join(dir, "default.enc")
+	writeFile(t, enc, encrypt([]byte("a"), id.Recipient(), false))
+	if f, _ := findAgeFile(dir); f != enc {
+		t.Errorf("by content: %q", f)
+	}
+	os.Remove(enc)
+	if os.Getuid() == 0 {
+		return
+	}
+	sub := filepath.Join(dir, "sub")
+	os.Mkdir(sub, 0)
+	defer os.Chmod(sub, 0o700)
+	if _, err := findAgeFile(dir); err == nil {
+		t.Error("an unreadable directory was searched as if empty")
+	}
+}
+
+func TestLeftover(t *testing.T) {
+	for name, want := range map[string]bool{
+		".secrets.age.aB3dE9":     true,
+		"secrets.age.new.12345":   true,
+		"secrets.age.rekey":       true,
+		"my.new.age":              false,
+		"secrets.age":             false,
+		"secrets.age.bak":         false,
+		".secrets.age.bak.aB3dE9": true,
+	} {
+		if got := leftover(name); got != want {
+			t.Errorf("leftover(%q) = %v", name, got)
+		}
+	}
+}

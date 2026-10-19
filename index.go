@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -89,11 +90,17 @@ func loadIndex(id *age.X25519Identity) (*vaultIndex, error) {
 }
 
 // mustLoadIndex is loadIndex for commands that write the vault, which
-// refuse to go on with an index they cannot trust.
+// refuse to go on with an index they cannot trust, or without one: a
+// missing index is rebuilt only by init, on purpose, never by whatever
+// command happens to write next, which would take every file as it is.
 func mustLoadIndex(id *age.X25519Identity, failed string) *vaultIndex {
 	ix, err := loadIndex(id)
 	if err != nil {
-		die("%v; %s. To go on without descriptions and checksums, move it out of %s", err, failed, vaultDir)
+		die("%v; %s. Move it out of %s and run %s init to make a new one from the vault as it is now", err, failed, vaultDir, prog)
+	}
+	if ix.isNew {
+		die("%s is missing; %s. %s init makes a new one from the vault as it is now; check the files first (%s list, %s cat)",
+			indexPath(), failed, prog, prog, prog)
 	}
 	return ix
 }
@@ -124,16 +131,14 @@ func (ix *vaultIndex) save(id *age.X25519Identity) {
 	publishOver(stage(ix.seal(id), indexPath()), indexPath())
 }
 
-// adopt records, in a new index, every vault file that decrypts with
-// the identity, trusting them as they are now. It runs once, when the
-// index is first created.
-func (ix *vaultIndex) adopt(id *age.X25519Identity) {
-	if !ix.isNew {
-		return
-	}
+// adopt records every file in the vault directory that decrypts with
+// the identity, whatever its name, trusting it as it is now, and returns
+// their names. Only init calls it.
+func (ix *vaultIndex) adopt(id *age.X25519Identity) []string {
+	var names []string
 	for _, name := range vaultEntries() {
 		path := filepath.Join(vaultDir, name)
-		if !isVaultName(name) || name == indexName || sameFile(path, identityPath) {
+		if name == indexName || leftover(name) || sameFile(path, identityPath) {
 			continue
 		}
 		if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() || ageKind(path) != "x25519" {
@@ -145,9 +150,19 @@ func (ix *vaultIndex) adopt(id *age.X25519Identity) {
 		}
 		if _, err := decrypt(ct, id); err == nil {
 			ix.record(name, ct)
+			names = append(names, name)
 		}
 	}
 	ix.isNew = false
+	return names
+}
+
+// A file viage leaves only when it is stopped partway: a staged file
+// (see stage), an edit that could not be saved, a rekey's new copy.
+var newName = regexp.MustCompile(`\.new\.[0-9]+$`)
+
+func leftover(name string) bool {
+	return stagedName.MatchString(name) || newName.MatchString(name) || strings.HasSuffix(name, ".rekey")
 }
 
 func isVaultName(name string) bool {
@@ -161,7 +176,7 @@ func cmdDescribe(args []string) {
 	}
 	path := resolve(args[0])
 	name := inVault(path)
-	if name == "" || !isVaultName(name) || name == indexName {
+	if name == "" || name == indexName || leftover(name) || sameFile(path, identityPath) {
 		die("%s is not a file in %s", path, vaultDir)
 	}
 	if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() {
@@ -176,18 +191,9 @@ func cmdDescribe(args []string) {
 	lockVault()
 	id := unlock()
 	ix := mustLoadIndex(id, "nothing changed")
-	ix.adopt(id)
 	m := ix.Files[name]
 	if m == nil {
-		ct, err := os.ReadFile(path)
-		if err != nil {
-			die("cannot read %s: %v", path, err)
-		}
-		if _, err := decrypt(ct, id); err != nil {
-			die("%s does not decrypt with this identity; %s add brings it in", path, prog)
-		}
-		ix.record(name, ct)
-		m = ix.Files[name]
+		die("%s is not in the index; %s add %s brings it in", name, prog, path)
 	}
 	m.Description = text
 	ix.save(id)
