@@ -1,5 +1,8 @@
 package main
 
+// The index (index.age): a description and checksum for each vault
+// file, authenticated with the identity; and viage describe.
+
 import (
 	"crypto/hmac"
 	"crypto/sha256"
