@@ -103,7 +103,7 @@ your sops files use can itself live in the viage vault.
 
 ## Install
 
-Build it with Go 1.27 or later; viage does not need the age command
+Build it with Go 1.26 or later; viage does not need the age command
 itself. `wl-copy` is optional (see [Copying a secret](#copying-a-secret)).
 
 ```

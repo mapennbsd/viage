@@ -1,6 +1,6 @@
 module github.com/mapennbsd/viage
 
-go 1.27.0
+go 1.26.0
 
 require (
 	filippo.io/age v1.3.2
