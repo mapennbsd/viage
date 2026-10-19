@@ -494,8 +494,8 @@ Points to be aware of:
   be read, it refuses. On macOS a RAM disk looks like any other volume,
   so `VIAGE_TMPDIR` must be set and you vouch for it. Non-dumpable memory
   is Linux only; elsewhere viage sets the core limit alone. Tested on
-  Linux (Arch), FreeBSD and OpenBSD 7.9; it builds for macOS but has
-  not been run there.
+  Arch Linux, Ubuntu 24.04, FreeBSD and OpenBSD 7.9; it builds for
+  macOS but has not been run there.
 - **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
   Its working file goes to the private directory, but if it is killed or
   the terminal hangs up, it saves a recovery copy, in plaintext, to
