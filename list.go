@@ -1,5 +1,8 @@
 package main
 
+// viage list: what is in the vault, from the file headers alone, or
+// with -v checked against the index.
+
 import (
 	"fmt"
 	"io/fs"
