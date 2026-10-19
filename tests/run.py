@@ -387,7 +387,12 @@ def test_add_from_ram(env):
     assert status == 0, out
     dest = env["VIAGE_DIR"] + "/api-token.age"
     assert "added " + dest + "; removed " + src in out, out
-    assert "persistent storage" not in out, out
+    if sys.platform == "darwin":
+        # A RAM disk cannot be told from any other volume there, so
+        # viage warns as it would for a file on disk.
+        assert "persistent storage" in out, out
+    else:
+        assert "persistent storage" not in out, out
     assert not os.path.exists(src)
     assert plaintext(env, path=dest) == "tok=1\n"
     assert mode(dest) == 0o600
