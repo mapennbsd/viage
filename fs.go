@@ -2,6 +2,10 @@
 
 package main
 
+// Telling a RAM-backed filesystem from one on disk, by the type of the
+// filesystem under a path or an open file. The per-system part is in
+// fs_<system>.go.
+
 import "golang.org/x/sys/unix"
 
 // fsType returns the type of the filesystem holding path: "tmpfs",
