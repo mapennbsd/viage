@@ -21,6 +21,9 @@
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 package main
 
+// The command line: settings from the environment, the usage text, and
+// which command runs.
+
 import (
 	"fmt"
 	"os"
