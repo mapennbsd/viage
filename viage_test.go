@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -288,5 +289,37 @@ func TestLeftover(t *testing.T) {
 		if got := leftover(name); got != want {
 			t.Errorf("leftover(%q) = %v", name, got)
 		}
+	}
+}
+
+// A running program is still writable if its mode says so: the BSDs'
+// access answers ETXTBSY for it, which must not read as "no".
+func TestCanWriteRunning(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root may write anything")
+	}
+	src, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep")
+	}
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog := filepath.Join(t.TempDir(), "sleep")
+	writeFile(t, prog, b)
+	os.Chmod(prog, 0o700)
+	cmd := exec.Command(prog, "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Wait()
+	defer cmd.Process.Kill()
+	if !canWrite(prog) {
+		t.Error("a running program with mode 0700 was taken as not writable")
+	}
+	os.Chmod(prog, 0o500)
+	if canWrite(prog) {
+		t.Error("a running program with mode 0500 was taken as writable")
 	}
 }

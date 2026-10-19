@@ -461,11 +461,41 @@ func checkWritable(cmds ...string) {
 }
 
 func writable(p string) {
-	if unix.Access(p, unix.W_OK) == nil {
+	if canWrite(p) {
 		warn("warning: %s is writable by you; anything running as you could replace it", p)
-	} else if unix.Access(filepath.Dir(p), unix.W_OK) == nil {
+	} else if canWrite(filepath.Dir(p)) {
 		warn("warning: %s is writable by you; anything running as you could replace %s", filepath.Dir(p), p)
 	}
+}
+
+// canWrite reports whether you could write p. On FreeBSD and OpenBSD,
+// access says ETXTBSY for any program that is running, viage itself
+// included, whoever may write it; then the owner and mode decide (ACLs
+// are not read).
+func canWrite(p string) bool {
+	err := unix.Access(p, unix.W_OK)
+	if err != unix.ETXTBSY {
+		return err == nil
+	}
+	var st unix.Stat_t
+	if unix.Stat(p, &st) != nil {
+		return false
+	}
+	switch {
+	case int(st.Uid) == os.Getuid():
+		return st.Mode&0o200 != 0
+	case inGroup(int(st.Gid)):
+		return st.Mode&0o020 != 0
+	}
+	return st.Mode&0o002 != 0
+}
+
+func inGroup(gid int) bool {
+	if gid == os.Getgid() {
+		return true
+	}
+	gs, _ := os.Getgroups()
+	return slices.Contains(gs, gid)
 }
 
 // looseMode returns the mode of a file if anyone but its owner has
