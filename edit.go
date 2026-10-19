@@ -1,5 +1,9 @@
 package main
 
+// viage init, cat and edit (the default command): creating a vault or
+// its index, printing a file, and editing one through a plaintext copy
+// in the private RAM-backed directory.
+
 import (
 	"bytes"
 	"fmt"
