@@ -1,5 +1,8 @@
 package main
 
+// viage rekey: a new identity and passphrase, with every vault file
+// re-encrypted to them, or nothing changed.
+
 import (
 	"bytes"
 	"errors"
