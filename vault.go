@@ -1,5 +1,9 @@
 package main
 
+// What the commands share: passphrases, the private RAM-backed
+// directory, the vault lock, writing files safely, age encryption, the
+// identity, and checks on the programs viage trusts.
+
 import (
 	"bufio"
 	"bytes"
