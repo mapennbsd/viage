@@ -157,6 +157,41 @@ to convert one to text without re-encrypting it:
   echo '-----END AGE ENCRYPTED FILE-----'; } > identity.age.txt
 ```
 
+### On FreeBSD and OpenBSD
+
+Neither has a RAM-backed directory for viage by default (`/tmp` is on
+disk), so viage refuses until there is one. Mount a small one for your
+user at boot and point `VIAGE_TMPDIR` at it (below, `you` is your user
+and 1000 your uid). On FreeBSD, as root:
+
+```
+install -d -o you -g you -m 700 /home/you/.viage-tmp
+echo 'tmpfs /home/you/.viage-tmp tmpfs rw,size=64m,mode=700,uid=1000,gid=1000 0 0' >> /etc/fstab
+mount /home/you/.viage-tmp
+```
+
+On OpenBSD, an mfs. Check its owner and mode once it is mounted
+(`ls -ld`) and make it yours, mode 700:
+
+```
+install -d -o you -g you -m 700 /home/you/.viage-tmp
+echo 'swap /home/you/.viage-tmp mfs rw,nodev,nosuid,-s=64m 0 0' >> /etc/fstab
+mount /home/you/.viage-tmp
+chown you:you /home/you/.viage-tmp && chmod 700 /home/you/.viage-tmp
+```
+
+Then, in your shell profile:
+
+```
+export VIAGE_TMPDIR=/home/you/.viage-tmp
+export VIAGE_EDITOR=vim
+```
+
+`vi` there is nvi, which can leave plaintext recovery files (see
+[What it protects against](#what-it-protects-against-and-what-it-does-not)).
+Swap can hold the tmpfs or mfs pages: OpenBSD encrypts it by default; on
+FreeBSD use an `.eli` swap device.
+
 ## Use
 
 ```
@@ -460,8 +495,8 @@ Points to be aware of:
   be read, it refuses. On macOS a RAM disk looks like any other volume,
   so `VIAGE_TMPDIR` must be set and you vouch for it. Non-dumpable memory
   is Linux only; elsewhere viage sets the core limit alone. Tested on
-  Linux; it builds for FreeBSD, OpenBSD and macOS but has not yet been
-  run there.
+  Linux (Arch), FreeBSD and OpenBSD 7.9; it builds for macOS but has
+  not been run there.
 - **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
   Its working file goes to the private directory, but if it is killed or
   the terminal hangs up, it saves a recovery copy, in plaintext, to
@@ -481,7 +516,8 @@ The Go tests cover what the binary cannot be driven into from outside.
 `tests/run.py` is the test of record: it drives viage's passphrase
 prompts through a pseudo-terminal and needs Python and the age command,
 which it uses to make and check files independently of viage. It tests
-`build/viage`, or the binary named by `VIAGE_BIN`.
+`build/viage`, or the binary named by `VIAGE_BIN`. On the BSDs, set
+`VIAGE_TMPDIR` first, as for normal use.
 
 ## License
 
