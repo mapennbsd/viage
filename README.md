@@ -191,6 +191,23 @@ export VIAGE_EDITOR=vim
 Swap can hold the tmpfs or mfs pages: OpenBSD encrypts it by default; on
 FreeBSD use an `.eli` swap device.
 
+### On macOS
+
+macOS cannot report that a volume is in RAM, so viage takes
+`VIAGE_TMPDIR` on trust: point it at a RAM disk, made after each boot,
+private, and kept out of Spotlight:
+
+```
+dev=$(hdiutil attach -nomount ram://131072)
+diskutil erasevolume HFS+ viage-tmp $dev
+chmod 700 /Volumes/viage-tmp
+sudo mdutil -i off /Volumes/viage-tmp
+export VIAGE_TMPDIR=/Volumes/viage-tmp
+```
+
+For the same reason, `viage add` and `viage cat` treat a file on the RAM
+disk as if it were on disk, and warn. Swap is encrypted by default.
+
 ## Use
 
 ```
@@ -494,8 +511,7 @@ Points to be aware of:
   be read, it refuses. On macOS a RAM disk looks like any other volume,
   so `VIAGE_TMPDIR` must be set and you vouch for it. Non-dumpable memory
   is Linux only; elsewhere viage sets the core limit alone. Tested on
-  Arch Linux, Ubuntu 24.04, FreeBSD and OpenBSD 7.9; it builds for
-  macOS but has not been run there.
+  Arch Linux, Ubuntu 24.04, FreeBSD, OpenBSD 7.9 and macOS.
 - **nvi.** `vi` on the BSDs is nvi, which viage runs as an unknown editor.
   Its working file goes to the private directory, but if it is killed or
   the terminal hangs up, it saves a recovery copy, in plaintext, to
