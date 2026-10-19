@@ -2,6 +2,8 @@
 
 package main
 
+// Hardening the process on systems other than Linux: no core dumps.
+
 import (
 	"fmt"
 
