@@ -18,11 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LINUX = sys.platform.startswith("linux")
 # A RAM-backed directory for the tests' own scratch space.
 RAMROOT = os.environ.get("VIAGE_TMPDIR") or os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-# The program under test: the shell script, or a build of the Go version
-# named by VIAGE_BIN. Both must pass the same tests.
-VIAGE = os.path.abspath(os.environ.get("VIAGE_BIN") or os.path.join(ROOT, "viage"))
-with open(VIAGE, "rb") as _f:
-    SHELL = _f.read(2) == b"#!"
+# The program under test: build/viage, or the binary named by VIAGE_BIN.
+VIAGE = os.path.abspath(os.environ.get("VIAGE_BIN") or os.path.join(ROOT, "build", "viage"))
 PASS = "correct horse battery staple"
 NEWPASS = "tr0ub4dor and 3"
 
@@ -719,24 +716,6 @@ def test_add_refuses_dangling_symlink_destination(env):
     os.remove(src)
 
 
-def test_unknown_filesystem_fails_closed(env):
-    # The Go version reads the type from the kernel, not from stat or df;
-    # its unit tests cover failing closed.
-    if not SHELL:
-        return
-    # Break both ways of reading the type: stat (Linux), df (elsewhere).
-    fake = env["HOME"] + "/fakebin"
-    os.mkdir(fake)
-    for cmd in ("stat", "df"):
-        with open(fake + "/" + cmd, "w") as f:
-            f.write("#!/bin/sh\nexit 1\n")
-        os.chmod(fake + "/" + cmd, 0o755)
-    env = dict(env, PATH=fake + ":" + env["PATH"])
-    editor(env, ":")
-    status, out = run([VIAGE], env)
-    assert status != 0 and "not tmpfs" in out, out
-
-
 def test_no_core_dumps(env):
     seen = env["HOME"] + "/core"
     editor(env, f'ulimit -c > "{seen}"')
@@ -745,15 +724,7 @@ def test_no_core_dumps(env):
     assert open(seen).read().strip() == "0"
 
 
-# --- the index (Go version only)
-
-
-def go_only(test):
-    def wrapper(env):
-        if not SHELL:
-            test(env)
-    wrapper.__name__ = test.__name__
-    return wrapper
+# --- the index
 
 
 def listing(env, *args, passphrase=PASS):
@@ -766,7 +737,6 @@ def listing(env, *args, passphrase=PASS):
     return out, rows
 
 
-@go_only
 def test_index_created_by_init(env):
     assert os.path.exists(env["VIAGE_DIR"] + "/index.age")
     out, rows = listing(env)
@@ -777,7 +747,6 @@ def test_index_created_by_init(env):
     assert "CHANGED" not in out and "MISSING" not in out, out
 
 
-@go_only
 def test_describe_and_add_m(env):
     src = env["VIAGE_TMPDIR"] + "/api-token"
     with open(src, "w") as f:
@@ -797,7 +766,6 @@ def test_describe_and_add_m(env):
     assert rows["secrets.age"].endswith("  default vault"), out
 
 
-@go_only
 def test_list_v_detects_a_swapped_file(env):
     add_secret(env)
     add_secret(env, "second=1")
@@ -809,7 +777,6 @@ def test_list_v_detects_a_swapped_file(env):
     assert "CHANGED" not in rows["secrets.age.bak"], out
 
 
-@go_only
 def test_forged_index_is_refused(env):
     # Encrypting to the identity needs only its public key, which anyone
     # who learns it can do. The index must still be rejected.
@@ -830,7 +797,6 @@ def test_forged_index_is_refused(env):
     assert vault_state(env) == before
 
 
-@go_only
 def test_list_v_reports_missing_files(env):
     src = env["VIAGE_TMPDIR"] + "/gone"
     with open(src, "w") as f:
@@ -842,7 +808,6 @@ def test_list_v_reports_missing_files(env):
     assert "MISSING" in rows["gone.age"], out
 
 
-@go_only
 def test_rekey_keeps_the_index(env):
     status, out = run([VIAGE, "describe", "secrets", "day-to-day secrets"], env)
     assert status == 0, out
@@ -854,14 +819,12 @@ def test_rekey_keeps_the_index(env):
     assert "CHANGED" not in out and "not authentic" not in out, out
 
 
-@go_only
 def test_index_is_not_edited_directly(env):
     editor(env, 'echo x >> "$1"')
     status, out = run([VIAGE, "index"], env)
     assert status != 0 and "describe" in out, out
 
 
-@go_only
 def test_missing_index_needs_init(env):
     # A vault from before the index, or one whose index was removed:
     # nothing that writes rebuilds it on the side. init does, on purpose.
@@ -914,7 +877,6 @@ def add_from_ram(env, name, content="x\n"):
     return env["VIAGE_DIR"] + "/" + name + ".age"
 
 
-@go_only
 def test_rekey_covers_a_default_with_another_name(env):
     default = env["VIAGE_DIR"] + "/default.enc"
     shutil.copy(env["VIAGE_FILE"], default)
@@ -926,7 +888,6 @@ def test_rekey_covers_a_default_with_another_name(env):
     assert plaintext(env, NEWPASS, default + ".bak") == ""
 
 
-@go_only
 def test_rekey_refuses_a_default_outside_the_vault(env):
     shutil.copy(env["VIAGE_FILE"], env["HOME"] + "/outside.age")
     # Starts with the vault directory, but is not in it.
@@ -935,7 +896,6 @@ def test_rekey_refuses_a_default_outside_the_vault(env):
     assert plaintext(env) == ""
 
 
-@go_only
 def test_rekey_refuses_an_unreadable_file(env):
     if os.getuid() == 0:
         return
@@ -952,7 +912,6 @@ def test_rekey_refuses_an_unreadable_file(env):
     assert plaintext(env, PASS, locked) == "x\n"
 
 
-@go_only
 def test_rekey_refuses_an_unreadable_subdirectory(env):
     if os.getuid() == 0:
         return
@@ -966,7 +925,6 @@ def test_rekey_refuses_an_unreadable_subdirectory(env):
         os.chmod(sub, 0o700)
 
 
-@go_only
 def test_rekey_finds_age_files_by_content(env):
     sub = env["VIAGE_DIR"] + "/sub"
     os.mkdir(sub)
@@ -974,7 +932,6 @@ def test_rekey_finds_age_files_by_content(env):
     rekey_refused(env, "notes.enc is in a subdirectory", deep=True)
 
 
-@go_only
 def test_rekey_refuses_leftovers_and_hard_links(env):
     staged = env["VIAGE_DIR"] + "/.secrets.age.aB3dE9"
     shutil.copy(env["VIAGE_FILE"], staged)
@@ -984,7 +941,6 @@ def test_rekey_refuses_leftovers_and_hard_links(env):
     rekey_refused(env, "other hard links")
 
 
-@go_only
 def test_backups_are_not_edited(env):
     add_secret(env)
     editor(env, 'echo x >> "$1"')
@@ -997,7 +953,6 @@ def test_backups_are_not_edited(env):
     assert status == 0, out
 
 
-@go_only
 def test_rekey_refuses_a_file_changed_outside_viage(env):
     add_secret(env)
     add_secret(env, "second=1")
@@ -1011,7 +966,6 @@ def test_rekey_refuses_a_file_changed_outside_viage(env):
     assert plaintext(env, NEWPASS) == "token=abc123\n"
 
 
-@go_only
 def test_rekey_refuses_a_file_not_in_the_index(env):
     # Anyone with the public key can make a file that decrypts.
     shutil.copy(env["VIAGE_FILE"], env["VIAGE_DIR"] + "/dropped.age")
@@ -1020,14 +974,12 @@ def test_rekey_refuses_a_file_not_in_the_index(env):
     assert status != 0 and "not in the index" in out, out
 
 
-@go_only
 def test_rekey_refuses_a_tracked_file_replaced_by_another_key(env):
     gone = add_from_ram(env, "token")
     foreign_key_file(env, gone)
     rekey_refused(env, "token.age changed outside viage")
 
 
-@go_only
 def test_rekey_drops_missing_files_from_the_index(env):
     gone = add_from_ram(env, "gone")
     os.remove(gone)
@@ -1037,7 +989,6 @@ def test_rekey_drops_missing_files_from_the_index(env):
     assert "MISSING" not in out, out
 
 
-@go_only
 def test_add_refuses_a_hard_link_to_the_destination(env):
     src = env["HOME"] + "/doc.age"
     with open(src, "w") as f:
@@ -1048,7 +999,6 @@ def test_add_refuses_a_hard_link_to_the_destination(env):
     assert read(src) == b"plain\n"
 
 
-@go_only
 def test_add_refuses_plaintext_with_other_hard_links(env):
     src = env["VIAGE_TMPDIR"] + "/token"
     with open(src, "w") as f:
@@ -1061,7 +1011,6 @@ def test_add_refuses_plaintext_with_other_hard_links(env):
     assert status == 0, out
 
 
-@go_only
 def test_term_to_viage_alone_stops_the_editor(env):
     # viage under a shell that outlives it, so no terminal hangup
     # reaches the editor: only viage itself can stop it.

@@ -474,15 +474,14 @@ Points to be aware of:
 ```
 go test ./...
 CGO_ENABLED=0 go build -trimpath -o build/viage .
-VIAGE_BIN=build/viage python3 tests/run.py
+python3 tests/run.py
 ```
 
 The Go tests cover what the binary cannot be driven into from outside.
 `tests/run.py` is the test of record: it drives viage's passphrase
 prompts through a pseudo-terminal and needs Python and the age command,
-which it uses to make and check files independently of viage. Without
-`VIAGE_BIN` it tests the shell version, which must pass the same tests,
-less those for the index.
+which it uses to make and check files independently of viage. It tests
+`build/viage`, or the binary named by `VIAGE_BIN`.
 
 ## License
 
