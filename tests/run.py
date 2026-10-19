@@ -178,7 +178,12 @@ def test_refuses_disk_tmpdir(env):
         env = dict(env, VIAGE_TMPDIR=disk)
         editor(env, ":")
         status, out = run([VIAGE], env)
-        assert status != 0 and "not tmpfs" in out, out
+        if sys.platform == "darwin":
+            # A RAM disk looks like any other volume there, so an
+            # explicit VIAGE_TMPDIR is taken on trust.
+            assert status == 0, out
+        else:
+            assert status != 0 and "not tmpfs" in out, out
     finally:
         shutil.rmtree(disk)
 
