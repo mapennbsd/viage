@@ -69,22 +69,22 @@ func initIndex() {
 	for _, n := range names {
 		warn("indexed %s as it is now", n)
 	}
-	warn("created %s. The files above are taken as they are now; check any", indexPath())
-	warn("you are unsure of with %s cat. Files not listed are left out.", prog)
+	warn("created %s. The files above are taken as they are now; check any\n"+
+		"you are unsure of with %s cat. Files not listed are left out.", indexPath(), prog)
 }
 
 // Say where cat's output is going and what will keep a copy of it.
 // Printed before the passphrase prompt, so there is time to ^C.
 func catWarning() {
 	if term.IsTerminal(1) {
-		warn("warning: printing plaintext to the terminal. Scrollback, a")
-		warn("multiplexer log, or an agent reading this terminal can keep it.")
+		warn("warning: printing plaintext to the terminal. Scrollback, a\n" +
+			"multiplexer log, or an agent reading this terminal can keep it.")
 		return
 	}
 	var st unix.Stat_t
 	if unix.Fstat(1, &st) != nil {
-		warn("warning: plaintext goes wherever stdout leads; a file on disk")
-		warn("outlives this command, in backups and snapshots too.")
+		warn("warning: plaintext goes wherever stdout leads; a file on disk\n" +
+			"outlives this command, in backups and snapshots too.")
 		return
 	}
 	switch st.Mode & unix.S_IFMT {
@@ -99,15 +99,15 @@ func catWarning() {
 		case "tmpfs", "ramfs", "mfs":
 			warn("warning: writing plaintext to %s (RAM-backed); remove it when done.", target)
 		default:
-			warn("warning: writing plaintext to %s on persistent storage. It", target)
-			warn("outlives this command, in backups and snapshots too.")
+			warn("warning: writing plaintext to %s on persistent storage. It\n"+
+				"outlives this command, in backups and snapshots too.", target)
 		}
 	case unix.S_IFIFO, unix.S_IFSOCK:
-		warn("warning: plaintext goes to a pipe, and the reader decides where it")
-		warn("ends up. To copy, use wl-copy --sensitive, not plain wl-copy.")
+		warn("warning: plaintext goes to a pipe, and the reader decides where it\n" +
+			"ends up. To copy, use wl-copy --sensitive, not plain wl-copy.")
 	default:
-		warn("warning: plaintext goes wherever stdout leads; a file on disk")
-		warn("outlives this command, in backups and snapshots too.")
+		warn("warning: plaintext goes wherever stdout leads; a file on disk\n" +
+			"outlives this command, in backups and snapshots too.")
 	}
 }
 

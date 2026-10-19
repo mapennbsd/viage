@@ -197,8 +197,8 @@ flags:
 			warn("added %s; removed %s", shown(it.dest), it.src)
 		}
 		if exposed {
-			warn("warning: %s was plaintext on persistent storage. Deleting it does", it.src)
-			warn("not reach the snapshots and backups that already copied it.")
+			warn("warning: %s was plaintext on persistent storage. Deleting it does\n"+
+				"not reach the snapshots and backups that already copied it.", it.src)
 		}
 	}
 }

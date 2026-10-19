@@ -159,8 +159,8 @@ func cmdRekey() {
 	}
 	sort.Strings(gone)
 	for _, name := range gone {
-		warn("%s is in the index but not in %s; dropping it. A copy kept", name, vaultDir)
-		warn("elsewhere opens only with the old identity.")
+		warn("%s is in the index but not in %s; dropping it. A copy kept\n"+
+			"elsewhere opens only with the old identity.", name, vaultDir)
 		delete(ix.Files, name)
 	}
 
@@ -204,10 +204,11 @@ func cmdRekey() {
 	for _, it := range items {
 		warn("rekeyed %s", shown(it.path))
 	}
-	warn("new identity in %s. Update every copy of the passphrase", identityPath)
-	warn("and of %s kept elsewhere. Older copies of the identity,", filepath.Base(identityPath))
-	warn("in snapshots and backups, still open these files as they were before")
-	warn("now; rotate the secrets themselves if the old passphrase may be known.")
+	warn("new identity in %s. Update every copy of the passphrase\n"+
+		"and of %s kept elsewhere. Older copies of the identity,\n"+
+		"in snapshots and backups, still open these files as they were before\n"+
+		"now; rotate the secrets themselves if the old passphrase may be known.",
+		identityPath, filepath.Base(identityPath))
 }
 
 func mustRename(from, to string) {

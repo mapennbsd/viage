@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,8 +29,12 @@ var (
 	stopping   os.Signal   // a HUP or TERM that arrived while it ran
 )
 
+// warn prints a message as "viage: message". The lines of a longer
+// message are lined up under the first, so it reads as one.
 func warn(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, prog+": "+format+"\n", a...)
+	msg := fmt.Sprintf(format, a...)
+	msg = strings.ReplaceAll(msg, "\n", "\n"+strings.Repeat(" ", len(prog)+2))
+	fmt.Fprintf(os.Stderr, "%s: %s\n", prog, msg)
 }
 
 func die(format string, a ...any) {
@@ -58,10 +63,10 @@ func cleanup() {
 	case "writing":
 		removeRekeyFiles()
 	case "committing":
-		warn("rekey interrupted while renaming files into place.")
-		warn("The old identity is %s.old. Files still named *.rekey", identityPath)
-		warn("are encrypted to the new identity; rename them over the originals.")
-		warn("The vault stays locked until then; afterwards remove %s.", lockDir)
+		warn("rekey interrupted while renaming files into place.\n"+
+			"The old identity is %s.old. Files still named *.rekey\n"+
+			"are encrypted to the new identity; rename them over the originals.\n"+
+			"The vault stays locked until then; afterwards remove %s.", identityPath, lockDir)
 		lockDir = ""
 	}
 	rekeying = ""
