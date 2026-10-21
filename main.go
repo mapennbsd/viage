@@ -34,7 +34,7 @@ import (
 
 const (
 	prog    = "viage"
-	version = "1.0.1"
+	version = "1.1.0"
 )
 
 var (
@@ -51,6 +51,8 @@ func usage() string {
                                encrypt files into the vault, then remove them
        %[1]s describe name [text]
                                set or clear the description of a vault file
+       %[1]s rm name...        remove vault files, their backups and their
+                               entries in the index
        %[1]s list [-v]         show what is in the vault; -v unlocks it to
                                show descriptions and check every file
        %[1]s init              create the identity and an empty vault, or
@@ -160,6 +162,8 @@ func main() {
 		cmdAdd(args[1:])
 	case "describe":
 		cmdDescribe(args[1:])
+	case "rm":
+		cmdRm(args[1:])
 	case "list", "ls":
 		switch {
 		case len(args) == 1:
