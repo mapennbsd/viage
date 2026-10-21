@@ -649,7 +649,7 @@ def test_lock_refuses_writers(env):
         f.write("x\n")
     before = vault_state(env)
     editor(env, 'echo junk >> "$1"')
-    for args in ([VIAGE], [VIAGE, "add", src], [VIAGE, "rekey"]):
+    for args in ([VIAGE], [VIAGE, "add", src], [VIAGE, "rm", "x"], [VIAGE, "rekey"]):
         status, out = run(args, env)
         assert status != 0 and f"in use by process {os.getpid()}" in out, (args, out)
         assert "passphrase" not in out.lower(), out
@@ -1073,6 +1073,85 @@ def test_term_to_viage_alone_stops_the_editor(env):
     except ProcessLookupError:
         alive = False
     assert not alive, "the editor outlived viage"
+
+
+# --- 1.1.0: rm
+
+def test_rm_removes_the_file_its_backup_and_their_entries(env):
+    notes = add_from_ram(env, "notes")
+    editor(env, 'echo more >> "$1"')
+    status, out = run([VIAGE, "notes"], env)
+    assert status == 0 and os.path.exists(notes + ".bak"), out
+    keep = add_from_ram(env, "keep")
+    status, out = run([VIAGE, "rm", "notes"], env)
+    assert status == 0, out
+    lines = [line.strip() for line in out.splitlines()]
+    assert "viage: removed notes.age" in lines and "viage: removed notes.age.bak" in lines, out
+    assert "rekey" in out, out
+    assert not os.path.exists(notes) and not os.path.exists(notes + ".bak")
+    assert os.path.exists(keep)
+    out, rows = listing(env, "-v")
+    assert "notes" not in out and "MISSING" not in out and "keep.age" in rows, out
+    # Nothing is left that rekey would stop at.
+    status, out = run([VIAGE, "rekey"], env, [PASS, NEWPASS, NEWPASS])
+    assert status == 0 and "notes" not in out, out
+
+
+def test_rm_several_and_a_backup_alone(env):
+    add_secret(env)
+    add_secret(env, "second=1")
+    a, b = add_from_ram(env, "a"), add_from_ram(env, "b")
+    secrets = read(env["VIAGE_FILE"])
+    status, out = run([VIAGE, "rm", "a", "b.age", "secrets.age.bak"], env)
+    assert status == 0, out
+    assert not any(map(os.path.exists, (a, b, env["VIAGE_FILE"] + ".bak"))), out
+    assert read(env["VIAGE_FILE"]) == secrets
+    out, rows = listing(env, "-v")
+    assert "MISSING" not in out and "secrets.age" in rows, out
+
+
+def test_rm_drops_a_missing_entry(env):
+    gone = add_from_ram(env, "gone")
+    os.remove(gone)
+    status, out = run([VIAGE, "rm", "gone"], env)
+    assert status == 0 and "dropped gone.age from the index" in out, out
+    assert "rekey" not in out, out
+    out, rows = listing(env, "-v")
+    assert "MISSING" not in out, out
+
+
+def test_rm_a_file_not_in_the_index(env):
+    stray = env["VIAGE_DIR"] + "/stray.age"
+    foreign_key_file(env, stray)
+    status, out = run([VIAGE, "rm", "stray"], env)
+    assert status == 0 and "removed stray.age, which was not in the index" in out, out
+    assert not os.path.exists(stray)
+
+
+def test_rm_refuses_and_changes_nothing(env):
+    add_secret(env)
+    add_from_ram(env, "keep")
+    outside = env["HOME"] + "/outside.age"
+    foreign_key_file(env, outside)
+    os.mkdir(env["VIAGE_DIR"] + "/dir.age")
+    before = vault_state(env)
+    for args, needle in (
+        (["identity.age"], "is not a file in"),
+        (["index"], "is not a file in"),
+        ([outside], "is not a file in"),
+        (["secrets"], "is the default vault"),
+        (["dir"], "is not a regular file"),
+        (["keep", "nosuch"], "nosuch.age not found"),
+        (["-k", "keep"], "usage:"),
+        ([], "usage:"),
+    ):
+        status, out = run([VIAGE, "rm", *args], env)
+        assert status != 0 and needle in out, (args, out)
+        assert vault_state(env) == before, args
+    status, out = run([VIAGE, "rm", "keep"], env, "wrong")
+    assert status != 0 and "cannot unlock" in out, out
+    assert vault_state(env) == before
+    assert os.path.exists(outside)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

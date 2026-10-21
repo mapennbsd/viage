@@ -218,6 +218,7 @@ viage cat notes
 viage add file...  # encrypt files into the vault and remove the originals
 viage add -m "LUKS header backup, root" root.luks-header
 viage describe notes "meeting notes"
+viage rm notes      # remove notes.age, its backup and its index entry
 viage list         # what is in the vault, without the passphrase
 viage list -v      # with descriptions, checking every file
 viage rekey        # new identity and passphrase for everything in $VIAGE_DIR
@@ -233,7 +234,7 @@ use `viage cat` to get it out. Neither is a backup (`*.age.bak`), which
 `viage cat` shows.
 
 Like `vipw`, viage writes the vault one command at a time. `edit`, `add`,
-`describe`, `rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
+`describe`, `rm`, `rekey` and `init` take a lock (`$VIAGE_DIR/.lock`) and hold it until they
 finish; an edit holds it for as long as the editor is open. Another
 writer started meanwhile stops with "the vault is in use". Reading
 (`cat`, `list`) needs no lock. The shell versions use the same lock, so
@@ -280,6 +281,27 @@ cryptsetup luksHeaderBackup /dev/nvme0n1p2 --header-backup-file /run/user/1000/r
 viage add /run/user/1000/root.luks-header
 ```
 
+### Removing files
+
+`viage rm` removes a vault file, its backup (`name.age.bak`) and their
+entries in the index, after the passphrase, since only the identity can
+rewrite the index. A backup can be removed on its own
+(`viage rm notes.age.bak`). Every name is checked before anything is
+removed. The identity, the index and the default vault are refused; to
+retire the default vault, point `$VIAGE_FILE` at another file first.
+
+A file deleted with plain `rm` shows as MISSING in `viage list -v`
+until its entry goes; `viage rm` on the name drops it. A file in the
+vault directory that is not in the index is removed all the same, and
+viage says so.
+
+Removing a vault file is an ordinary delete, like removing the original
+in `viage add`, but what is left behind is ciphertext. Copies in
+snapshots and backups still open with the identity, so run
+`viage rekey` afterwards if the file should be out of reach: the old
+copies then need the old identity and the old passphrase. If it held a
+credential, revoking the credential matters more than either.
+
 ### Listing the vault
 
 `viage list` shows each file with its size and date: your files first,
@@ -321,7 +343,8 @@ checks every file against its checksum. It flags:
   may be an older copy put back, a file swapped for another one from the
   vault, or a viage interrupted between writing a file and the index.
   Check it with `viage cat`. `viage add` on the file records it as it is.
-- **MISSING:** in the index, but not in the vault.
+- **MISSING:** in the index, but not in the vault. `viage rm` on the
+  name drops the entry.
 - **not in the index:** a file that opens with the identity but that
   viage did not write. Check it with `viage cat`; `viage add` on the
   file records it.
